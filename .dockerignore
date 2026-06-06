@@ -1,0 +1,36 @@
+# Build context exclusions
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Runtime artifacts (mounted as volumes at runtime)
+data/*.sqlite
+data/*.sqlite-journal
+data/*.sqlite-wal
+data/*.sqlite-shm
+logs/
+
+# Secrets / local config
+.env
+*.local
+
+# VCS
+.git/
+.gitignore
+
+# IDE / OS noise
+.idea/
+.vscode/
+.DS_Store
+
+# Docs (not needed in the bot image)
+*.md
+docs/
+
+# Tests (not needed at runtime; run on host or CI)
+tests/

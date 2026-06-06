@@ -1,0 +1,44 @@
+# Polymarket BTC UP/DOWN state-pricing bot (PAPER)
+#
+# Usage:
+#   docker compose build
+#   docker compose up -d              # start (15m timeframe, restart: unless-stopped)
+#   docker compose logs -f            # tail logs
+#   docker compose stop               # graceful stop
+#   docker compose down               # remove container (data/ and logs/ persist on host)
+#
+# The .env file is loaded into the container's environment. The Dockerfile
+# sets STATE_RULES_PATH and DATABASE_PATH to absolute /app paths; everything
+# else comes from .env. Override any value here under `environment:`.
+services:
+  bot:
+    build: .
+    image: polymarket-updown-bot:local
+    container_name: polymarket_updown_bot
+    restart: unless-stopped
+    # Run as the host user so bind-mounted ./data and ./logs are writable.
+    # Override with HOST_UID/HOST_GID env vars (e.g.
+    # `HOST_UID=1001 HOST_GID=1001 docker compose up -d`). UID/GID are
+    # reserved by bash, hence the HOST_ prefix.
+    user: "${HOST_UID:-1000}:${HOST_GID:-1000}"
+    env_file: .env
+    environment:
+      TZ: UTC
+    volumes:
+      # Persist the SQLite DB and any per-decision snapshots.
+      - ./data:/app/data
+      # Host-side log directory (the bot writes via Python logging; you may
+      # also want to add a logging driver in production, see docker-compose docs).
+      - ./logs:/app/logs
+      # Mount config/ as a volume so you can iterate on the rules JSON
+      # without rebuilding the image.
+      - ./config:/app/config
+    command: ["--timeframe", "15m", "--mode", "paper"]
+    # Healthcheck: ensure the bot is alive (writes a decision every cycle).
+    # For a paper run we don't have a single endpoint to probe, so we rely
+    # on restart: unless-stopped and the user tailing logs.
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

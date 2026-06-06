@@ -1,0 +1,460 @@
+"""Main runner — orchestrates discovery -> state -> rule -> decision -> paper trade.
+
+One-shot mode (--once): run a single decision cycle and exit.
+Continuous mode: loop, sleep between cycles, manage mark-to-market
+and settlement.
+"""
+from __future__ import annotations
+
+import json
+import logging
+import time
+import uuid
+from datetime import UTC, datetime
+from decimal import Decimal
+from typing import Any
+
+from .binance_client import fetch_recent_5m_klines
+from .config import Settings
+from .models import (
+    DecisionKind,
+    DecisionSnapshot,
+    MarkToMarket,
+    PositionStatus,
+    Side,
+    Stage,
+)
+from .paper_broker import PaperBroker
+from .polymarket_clob_client import fetch_pair_orderbook, levels_to_json
+from .polymarket_discovery import discover_market
+from .probability_rules import ProbabilityRules
+from .risk_manager import RiskManager
+from .round_state import build_round_state
+from .settlement import mark_position_settled, settle_position
+from .signal_engine import build_decision
+from .storage import Storage
+from .url_parser import UrlParserError, parse_market_url
+
+log = logging.getLogger("polymarket_round_bot")
+
+
+class RunnerError(RuntimeError):
+    """Raised on a non-recoverable runner error."""
+
+
+class Runner:
+    def __init__(
+        self,
+        *,
+        settings: Settings,
+        storage: Storage,
+        rules: ProbabilityRules,
+        broker: PaperBroker,
+        risk: RiskManager,
+        slug: str,
+    ) -> None:
+        self._settings = settings
+        self._storage = storage
+        self._rules = rules
+        self._broker = broker
+        self._risk = risk
+        self._slug = slug
+
+    # === One cycle ===
+
+    def run_one_cycle(self, *, now_utc: datetime | None = None) -> DecisionSnapshot:
+        now = now_utc or datetime.now(UTC)
+        log.info("run_one_cycle slug=%s", self._slug)
+
+        # 1. Discovery
+        market, alignment = discover_market(
+            self._slug,
+            timeout=self._settings.http_timeout_seconds,
+            user_agent=self._settings.http_user_agent,
+        )
+        log.info("market_discovered slug=%s alignment=%s", market.slug, alignment.alignment)
+
+        # 2. Binance state
+        binance = fetch_recent_5m_klines(
+            self._settings.btc_symbol,
+            limit=20,  # covers ~100 min of history; plenty for round_open + vol window
+            timeout=self._settings.http_timeout_seconds,
+            user_agent=self._settings.http_user_agent,
+        )
+        log.info(
+            "binance_loaded symbol=%s candles=%d current=%.2f",
+            binance.symbol,
+            len(binance.candles),
+            float(binance.current_price),
+        )
+
+        # 3. Round state
+        state = build_round_state(binance, market, now_utc=now)
+        log.info(
+            "round_state stage=%s side=%s dist_bucket=%s vol_bucket=%s pattern=%s secs_to_expiry=%d",
+            state.stage.value,
+            state.current_side.value,
+            state.distance_bucket.value,
+            state.volatility_bucket.value,
+            state.candle_pattern,
+            state.seconds_to_expiry,
+        )
+
+        # 4. Rule lookup
+        # CUSTOM_5M_STATE has no internal candles; lookup will miss all
+        # patterns unless rules for that stage exist.
+        lookup = self._rules.lookup(
+            stage=state.stage,
+            current_side=state.current_side,
+            distance_bucket=state.distance_bucket,
+            volatility_bucket=state.volatility_bucket,
+            pattern=state.candle_pattern,
+            min_samples=self._settings.min_samples,
+            min_historical_probability=self._settings.min_historical_probability,
+        )
+        log.info(
+            "rule_lookup match_type=%s rule_id=%s prob=%s samples=%d no_trade_reasons=%s",
+            lookup.match_type.value,
+            lookup.rule.rule_id if lookup.rule else None,
+            lookup.historical_probability,
+            lookup.samples,
+            lookup.no_trade_reasons,
+        )
+
+        # 5. Orderbook
+        pair = fetch_pair_orderbook(
+            market.up_token_id,
+            market.down_token_id,
+            timeout=self._settings.http_timeout_seconds,
+            user_agent=self._settings.http_user_agent,
+        )
+        log.info(
+            "orderbook up_bid=%s up_ask=%s down_bid=%s down_ask=%s",
+            pair.up.best_bid,
+            pair.up.best_ask,
+            pair.down.best_bid,
+            pair.down.best_ask,
+        )
+
+        # 6. Risk
+        open_positions = [(p.market_slug, p.selected_side) for p in self._broker.open_positions]
+        # Daily realised PnL = sum of today's settlements
+        today_iso = now.date().isoformat()
+        daily_pnl = self._daily_realized_pnl(today_iso)
+        risk_decision = self._risk.evaluate(
+            candidate_market_slug=market.slug,
+            candidate_side=lookup.recommended_side or Side.UP,
+            open_positions=open_positions,
+            daily_realized_pnl=daily_pnl,
+        )
+        log.info(
+            "risk allowed=%s reject=%s open=%d daily_pnl=%.4f",
+            risk_decision.allowed,
+            risk_decision.reject_reason,
+            risk_decision.open_positions_count,
+            float(daily_pnl),
+        )
+
+        # 7. Decision
+        # For CUSTOM_5M_STATE we still allow the engine to try, but
+        # rule lookup will most likely return no_match.
+        if state.stage == Stage.CUSTOM_5M_STATE:
+            # 5m stage is always allowed to attempt lookup; engine
+            # will skip with no_rule_for_state if no rule.
+            pass
+
+        decision = build_decision(
+            settings=self._settings,
+            state=state,
+            market=market,
+            orderbook=pair,
+            lookup=lookup,
+            risk_allowed=risk_decision.allowed,
+            risk_reject_reason=risk_decision.reject_reason,
+            open_positions_count=risk_decision.open_positions_count,
+            daily_realized_pnl=daily_pnl,
+            metadata_received_at_utc=datetime.now(UTC),
+            now_utc=now,
+        )
+        log.info("decision=%s reason=%s", decision.decision.value, decision.reason)
+
+        # 8. Open position if TRADE
+        if decision.decision == DecisionKind.TRADE and decision.side is not None:
+            try:
+                sel_ob = pair.up if decision.side == Side.UP else pair.down
+                self._broker.open_position(
+                    decision,
+                    round_open_price=state.round_open_price,
+                    btc_price_at_entry=state.current_btc_price,
+                    distance_bucket=state.distance_bucket,
+                    volatility_bucket=state.volatility_bucket,
+                    pattern=state.candle_pattern,
+                    stage=state.stage,
+                    seconds_to_expiry=state.seconds_to_expiry,
+                    entry_best_bid=sel_ob.best_bid or decision.market_ask or Decimal("0"),
+                )
+            except Exception as e:  # broker error
+                log.error("open_position_failed err=%s", e)
+
+        # 9. Snapshot + persist
+        snap = self._build_snapshot(
+            state=state,
+            market=market,
+            orderbook=pair,
+            lookup=lookup,
+            decision=decision,
+            risk_decision=risk_decision,
+            binance=binance,
+            metadata_received_at_utc=datetime.now(UTC),
+            now=now,
+        )
+        self._storage.insert_decision(snap)
+
+        # Persist position (if any)
+        for p in self._broker.open_positions:
+            if p.market_slug == market.slug and p.status == PositionStatus.OPEN:
+                self._storage.upsert_position(p)
+
+        return snap
+
+    # === Continuous mode ===
+
+    def run_continuously(
+        self,
+        *,
+        poll_interval_seconds: int = 5,
+        max_iterations: int | None = None,
+    ) -> None:
+        log.info("continuous_mode slug=%s poll=%ds", self._slug, poll_interval_seconds)
+        i = 0
+        while max_iterations is None or i < max_iterations:
+            i += 1
+            try:
+                self.run_one_cycle()
+                self._settle_due_positions()
+                self._mark_open_positions()
+            except Exception as e:
+                log.exception("cycle_error err=%s", e)
+            time.sleep(poll_interval_seconds)
+
+    # === Mark-to-market ===
+
+    def _mark_open_positions(self) -> None:
+        for p in self._broker.open_positions:
+            try:
+                book = fetch_pair_orderbook(
+                    p.token_id, p.token_id,  # we just need one side for MtM
+                    timeout=self._settings.http_timeout_seconds,
+                    user_agent=self._settings.http_user_agent,
+                )
+            except Exception:
+                # Fall back to the up/down books we have
+                continue
+            # We fetched only one token id; pick whichever side
+            snap_ob = book.up if book.up.token_id == p.token_id else book.down
+            best_bid = snap_ob.best_bid
+            shares = p.shares
+            exit_value = (best_bid * shares) if best_bid is not None else None
+            unrealized = (exit_value - p.entry_size_usd) if exit_value is not None else None
+            mtm = MarkToMarket(
+                position_id=p.position_id,
+                timestamp_utc=datetime.now(UTC),
+                best_bid=best_bid,
+                best_ask=snap_ob.best_ask,
+                mid_price=(
+                    (best_bid + snap_ob.best_ask) / 2
+                    if best_bid is not None and snap_ob.best_ask is not None
+                    else None
+                ),
+                estimated_exit_value_bid=exit_value,
+                unrealized_pnl_bid=unrealized,
+                btc_price=None,
+                distance_from_round_open=None,
+                seconds_to_expiry=None,
+            )
+            self._storage.insert_mtm(mtm)
+
+    # === Settlement ===
+
+    def _settle_due_positions(self) -> None:
+        for p in list(self._broker.open_positions):
+            # Re-discover to check resolution
+            try:
+                market, _ = discover_market(
+                    p.market_slug,
+                    timeout=self._settings.http_timeout_seconds,
+                    user_agent=self._settings.http_user_agent,
+                )
+            except Exception as e:
+                log.warning("settle_discover_failed slug=%s err=%s", p.market_slug, e)
+                continue
+            if not market.closed:
+                continue
+            final_btc = market_resolved_btc_price(market, p.round_open_price) or p.round_open_price
+            try:
+                settlement = settle_position(
+                    position=p,
+                    polymarket_resolved=market.resolved_outcome,
+                    final_btc_price=final_btc,
+                    round_close_price=final_btc,
+                )
+            except ValueError as e:
+                log.warning("settle_skipped slug=%s err=%s", p.market_slug, e)
+                continue
+            self._storage.insert_settlement(settlement)
+            settled = mark_position_settled(p)
+            self._storage.upsert_position(settled)
+            self._broker.close_position(p.market_slug, p.selected_side)
+            log.info(
+                "settled slug=%s side=%s won=%s pnl=%.4f quality=%s",
+                p.market_slug,
+                p.selected_side.value,
+                settlement.won,
+                float(settlement.realized_pnl_usd),
+                settlement.trade_quality.value,
+            )
+
+    # === Helpers ===
+
+    def _daily_realized_pnl(self, today_iso: str) -> Decimal:
+        settlements = self._storage.list_settlements(since_iso=f"{today_iso}T00:00:00+00:00")
+        return sum((s.realized_pnl_usd for s in settlements), Decimal("0"))
+
+    def _build_snapshot(
+        self,
+        *,
+        state: Any,
+        market: Any,
+        orderbook: Any,
+        lookup: Any,
+        decision: Any,
+        risk_decision: Any,
+        binance: Any,
+        metadata_received_at_utc: datetime,
+        now: datetime,
+    ) -> DecisionSnapshot:
+        # Pull the orderbook for the side we checked (recommended_side)
+        side_checked = lookup.recommended_side or decision.side or Side.UP
+        selected_ob = orderbook.up if side_checked == Side.UP else orderbook.down
+        opposite_ob = orderbook.down if side_checked == Side.UP else orderbook.up
+
+        # Binanace data age: from latest closed candle
+        last_candle = binance.candles[-1] if binance.candles else None
+        binance_age = (
+            Decimal(str((now - last_candle.open_time_utc).total_seconds() + 300))
+            if last_candle is not None
+            else Decimal("0")
+        )
+
+        return DecisionSnapshot(
+            decision_id=f"dec_{uuid.uuid4().hex[:12]}",
+            timestamp_utc=now,
+            market_slug=market.slug,
+            event_url=f"https://polymarket.com/event/{market.event_slug or market.slug}",
+            timeframe=state.timeframe,
+            round_start_ts=market.start_ts,
+            round_end_ts=market.end_ts,
+            seconds_to_expiry=state.seconds_to_expiry,
+            stage=state.stage,
+            side_checked=side_checked,
+            selected_side=decision.side,
+            outcome_token_id=selected_ob.token_id,
+            opposite_token_id=opposite_ob.token_id,
+            decision=decision.decision,
+            skip_reason=None if decision.decision == DecisionKind.TRADE else decision.reason,
+            round_open_price=state.round_open_price,
+            current_btc_price=state.current_btc_price,
+            current_side=state.current_side,
+            distance_from_round_open=state.distance_pct,
+            distance_bucket=state.distance_bucket,
+            volatility_bucket=state.volatility_bucket,
+            candle_pattern=state.candle_pattern,
+            pattern_combo=state.pattern_combo,
+            c0_open=state.c0.open if state.c0 else None,
+            c0_high=state.c0.high if state.c0 else None,
+            c0_low=state.c0.low if state.c0 else None,
+            c0_close=state.c0.close if state.c0 else None,
+            c0_volume=state.c0.volume if state.c0 else None,
+            c1_open=state.c1.open if state.c1 else None,
+            c1_high=state.c1.high if state.c1 else None,
+            c1_low=state.c1.low if state.c1 else None,
+            c1_close=state.c1.close if state.c1 else None,
+            c1_volume=state.c1.volume if state.c1 else None,
+            source_exchange="binance",
+            source_symbol=binance.symbol,
+            binance_data_received_at_utc=binance.received_at_utc,
+            binance_data_age_seconds=binance_age,
+            up_best_bid=orderbook.up.best_bid,
+            up_best_ask=orderbook.up.best_ask,
+            down_best_bid=orderbook.down.best_bid,
+            down_best_ask=orderbook.down.best_ask,
+            up_spread=orderbook.up.spread,
+            down_spread=orderbook.down.spread,
+            selected_best_bid=selected_ob.best_bid,
+            selected_best_ask=selected_ob.best_ask,
+            selected_spread=selected_ob.spread,
+            selected_ask_size=selected_ob.ask_size,
+            selected_bid_size=selected_ob.bid_size,
+            orderbook_depth_top_5_json=(
+                levels_to_json(selected_ob.top_5_bids)
+                + "|"
+                + levels_to_json(selected_ob.top_5_asks)
+            ),
+            liquidity_usd_estimate=selected_ob.liquidity_usd_estimate,
+            market_active=market.active,
+            market_closed=market.closed,
+            market_accepting_orders=market.accepting_orders,
+            orderbook_received_at_utc=orderbook.received_at_utc,
+            orderbook_age_seconds=Decimal(
+                str((now - orderbook.received_at_utc).total_seconds())
+            ),
+            metadata_received_at_utc=metadata_received_at_utc,
+            metadata_age_seconds=Decimal(
+                str((now - metadata_received_at_utc).total_seconds())
+            ),
+            rule_id=lookup.rule.rule_id if lookup.rule else None,
+            rule_match_type=lookup.match_type,
+            samples=lookup.samples,
+            historical_probability=lookup.historical_probability,
+            fair_price=decision.historical_probability,
+            safety_buffer=decision.safety_buffer,
+            max_buy_price=decision.max_buy_price,
+            market_ask=decision.market_ask,
+            edge_vs_ask=decision.edge_vs_ask,
+            min_edge_required=self._settings.min_edge,
+            recommended_side=lookup.recommended_side,
+            return_aligned=lookup.rule.return_aligned if lookup.rule else True,
+            requested_size_usd=decision.size_usd,
+            max_position_usd=self._settings.max_position_usd,
+            open_positions_count=risk_decision.open_positions_count,
+            max_open_positions=risk_decision.max_open_positions,
+            daily_realized_pnl=risk_decision.daily_realized_pnl,
+            max_daily_loss_usd=risk_decision.max_daily_loss_usd,
+            risk_allowed=risk_decision.allowed,
+            risk_reject_reason=risk_decision.reject_reason,
+        )
+
+
+def market_resolved_btc_price(market: Any, round_open: Decimal) -> Decimal | None:
+    """Best-effort final BTC price for fallback settlement.
+
+    Not implemented in v1 (we rely on Polymarket API resolution). The
+    Binance client would need to be queried for the close of the last
+    5m candle in the round. Kept as a hook for future fallback use.
+    """
+    return None
+
+
+def slug_from_url_or_slug(input_str: str) -> str:
+    """Best-effort extraction of the slug from a URL or bare slug."""
+    try:
+        return parse_market_url(input_str).slug
+    except UrlParserError:
+        # If not a full URL/slug, return the original (caller may
+        # re-discover and validate).
+        return input_str
+
+
+def settings_to_json(settings: Settings) -> str:
+    """Render settings to JSON for storage in bot_runs.settings_json."""
+    return json.dumps(settings.model_dump(mode="json"), default=str)
