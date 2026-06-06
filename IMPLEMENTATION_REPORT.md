@@ -1,9 +1,10 @@
 # Implementation Report
 
-**Date**: 2026-06-05
+**Date**: 2026-06-06 (audit fixes)
 **Project**: `/home/alex/Project/polymarket_updown_bot/`
 **Mode**: PAPER-only v1
-**Tests**: 62/62 passing · ruff clean · mypy strict clean
+**Tests**: 102/102 passing · ruff clean · mypy strict clean
+**HEAD**: `34a0558` (audit fix) on top of `439f95d` (slug advance)
 
 ---
 
@@ -381,3 +382,126 @@ All 23 acceptance criteria from the task are met:
 | 21 | Unit tests pass | ✅ 62/62 |
 | 22 | README/run instructions | ✅ |
 | 23 | Final implementation report | ✅ (this file) |
+
+---
+
+## 8. Post-audit fixes (2026-06-06)
+
+A code audit on 2026-06-06 revealed six runtime/strategy gaps
+between this report and the actual `signal_engine` logic. All fixed
+in commit `34a0558`.
+
+### 8.1 Issues found
+
+1. **`usable_signal` not enforced at runtime** (probability_rules.py).
+   The CSV flag was loaded into the `ProbabilityRule` model but never
+   checked. A rule with `usable_signal=False` could still trigger a
+   TRADE if it happened to pass the other three filters.
+2. **Fallback rules could trade** (signal_engine.py).
+   `match_type` was recorded in the decision snapshot but never
+   checked. A `FALLBACK_NO_PATTERN` lookup with strong-enough samples
+   was tradable.
+3. **No Binance freshness hard gate** (signal_engine.py).
+   `binance_price_max_age_seconds=10` was in `config.py` but never
+   referenced. Stale Binance data flowed into `RoundState` and
+   `current_side`/`distance_bucket` decisions.
+4. **No seconds-to-expiry gate** (signal_engine.py).
+   The field was computed and persisted but not validated. The bot
+   could theoretically trade at 0s or negative seconds to expiry.
+5. **`candle_features.py` did not match `polymarket_round_research_v2.py`**:
+   - Order of wick checks inverted (`bull_long_lower` before
+     `bull_long_upper`, opposite to research).
+   - `NORMAL_BULL`/`NORMAL_BEAR` was emitted for STRONG body (≥0.65)
+     without strong close, instead of medium body (0.10–0.65) as in
+     research.
+   - `body == 0` produced `doji_*` instead of `flat` (research emits
+     `flat` for `direction == 0`).
+   - The unused `_POSITION_NEAR_HIGH`/`_POSITION_NEAR_LOW` constants
+     were kept.
+6. **5m strategy implicit**, not explicit. The 5m stage SKIPped via
+   `no_rule_for_state`, but there was no explicit `allow_5m_trading`
+   gate surfacing the gap.
+
+### 8.2 Fixes applied
+
+1. `probability_rules.py`: `if not rule.usable_signal:
+   no_trade_reasons.append("usable_signal_false")` added before
+   the other three filters. Verified live at 17:44 UTC: rule
+   `btc_15m_after_10m_..._strong_bull_close_near_high_normal_bear`
+   (samples=14, prob=0.79) now SKIPs with
+   `rule_filtered:usable_signal_false;samples_below_threshold:14<60`.
+2. `signal_engine.py` + `config.py`: new gate
+   `if lookup.match_type != RuleMatchType.EXACT and not
+   settings.allow_fallback_trading: skip
+   "fallback_rule_not_tradeable_in_v1"`. `allow_fallback_trading=False`
+   by default.
+3. `signal_engine.py` + `runner.py`: new Binance freshness gate
+   using `binance.received_at_utc` and
+   `settings.binance_price_max_age_seconds`. `binance_received_at_utc`
+   is a new required parameter on `build_decision`.
+4. `signal_engine.py` + `config.py`: new stage-specific expiry
+   windows. Defaults: AFTER_5M [300, 600], AFTER_10M [60, 300] for
+   15m rounds. 5m timeframe is gated above before the expiry check
+   applies.
+5. `candle_features.py`: `_classify_pattern` rewritten to mirror
+   `polymarket_round_research_v2.py::candle_pattern` exactly:
+   - `flat_body` checked first → `flat` (matches research
+     `direction == 0`).
+   - `bull_long_upper_wick` checked before `bull_long_lower_wick`
+     (order parity).
+   - `weak_*` and `normal_*` paths in the `bull`/`bear` branches
+     use `is_small_body` and the implicit else, respectively.
+   - Removed `_POSITION_NEAR_HIGH` / `_POSITION_NEAR_LOW`
+     (no longer used).
+6. `signal_engine.py` + `config.py`: new `allow_5m_trading` flag
+   (default `False`). 5m state now produces an explicit
+   `5m_trading_disabled_in_v1` skip reason.
+
+### 8.3 Test additions
+
+- `tests/test_probability_rules.py`: +2 tests
+  (`test_no_trade_when_usable_signal_false`,
+  `test_usable_signal_true_passes_other_thresholds`).
+- `tests/test_signal_engine.py`: +7 tests
+  (Binance stale, fallback disallowed, fallback allowed,
+   expiry too early, expiry too late, expiry in window, 5m
+   disabled).
+- `tests/test_candle_features.py`: +13 new tests, 13 patterns
+  verified against research script with annotated
+  body/range, upper/range, lower/range values.
+
+Test count: **80 → 102 passing**. ruff: clean. mypy strict:
+clean.
+
+### 8.4 Live verification (2026-06-06 17:36–17:45 UTC)
+
+Post-deploy on `54.154.79.239`, slug `btc-updown-15m-1780767000`:
+
+- 17:36:01 — TRADE on exact rule
+  `btc_15m_after_5m_above_open_d_010_020pct_vol_normal_strong_bull_close_near_high`
+  (samples=345, prob=0.87, side=UP, edge=0.05). All four new gates
+  passed: usable_signal=True, EXACT match, expiry in [300, 600],
+  Binance data fresh.
+- 17:44:30 — SKIP on rule
+  `btc_15m_after_10m_..._strong_bull_close_near_high_normal_bear`
+  (samples=14, prob=0.79). The rule has `usable_signal=False` in
+  the research CSV; the new filter correctly catches it with
+  `usable_signal_false` even though samples/prob would have
+  passed.
+- All other decisions since restart: 0 FALLBACK trades, 0 stale
+  Binance, 0 expiry-out-of-range.
+
+### 8.5 Risk posture after audit
+
+| Failure mode | Before audit | After audit |
+|---|---|---|
+| Trade on a rule that research flagged unusable | possible | blocked (`usable_signal_false`) |
+| Trade on FALLBACK_NO_PATTERN bucket | possible | blocked (`fallback_rule_not_tradeable_in_v1`) |
+| Trade on stale Binance candle | possible | blocked (`stale_binance_data`, default 10s) |
+| Trade at 0s or negative expiry | possible | blocked (`seconds_to_expiry_out_of_range`) |
+| Trade on 5m market | `no_rule_for_state` (implicit) | `5m_trading_disabled_in_v1` (explicit) |
+| Candle classifier vs research CSV | 4 mismatches | parity |
+
+The bot is now in a "strict v1" posture: 58 strong rules drive
+decisions, all hard gates enforced, all pattern classifications
+match the research script. PAPER validation can continue.
