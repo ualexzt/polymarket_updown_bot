@@ -39,7 +39,7 @@ def _current_expected_slug(timeframe: Timeframe) -> str:
     Slug timestamp = window START (verified 2026-06-04).
     """
     interval_seconds = 5 * 60 if timeframe == Timeframe.M5 else 15 * 60
-    now = int(UTC.localize(datetime.utcnow()).timestamp())
+    now = int(datetime.now(UTC).timestamp())
     # Floor to nearest interval boundary
     boundary = (now // interval_seconds) * interval_seconds
     return f"btc-updown-{timeframe.value}-{boundary}"
