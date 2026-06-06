@@ -10,11 +10,11 @@ import json
 import logging
 import time
 import uuid
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Any
 
-from .binance_client import fetch_recent_5m_klines
+from .binance_client import fetch_5m_close_at, fetch_recent_5m_klines
 from .config import Settings
 from .models import (
     DecisionKind,
@@ -23,6 +23,7 @@ from .models import (
     PositionStatus,
     Side,
     Stage,
+    Timeframe,
 )
 from .paper_broker import PaperBroker
 from .polymarket_clob_client import fetch_pair_orderbook, levels_to_json
@@ -42,6 +43,31 @@ class RunnerError(RuntimeError):
     """Raised on a non-recoverable runner error."""
 
 
+def current_expected_slug(timeframe: Timeframe, *, now_utc: datetime | None = None) -> str:
+    """Slug of the currently active market for ``timeframe``.
+
+    Slug timestamp = window START (verified 2026-06-04).
+    Boundary is floored: 08:29:59 still belongs to the 08:15 window.
+    """
+    interval_seconds = 5 * 60 if timeframe == Timeframe.M5 else 15 * 60
+    now = int((now_utc or datetime.now(UTC)).timestamp())
+    boundary = (now // interval_seconds) * interval_seconds
+    return f"btc-updown-{timeframe.value}-{boundary}"
+
+
+def slug_window(slug: str) -> tuple[Timeframe, datetime, datetime]:
+    """Parse ``slug`` and return (timeframe, window_start_utc, window_end_utc).
+
+    Used by stale-position settlement to determine when a market window
+    has fully ended (and Binance fallback is therefore safe to apply).
+    """
+    parsed = parse_market_url(slug)
+    interval_seconds = 5 * 60 if parsed.timeframe == Timeframe.M5 else 15 * 60
+    start = datetime.fromtimestamp(parsed.timestamp, tz=UTC)
+    end = datetime.fromtimestamp(parsed.timestamp + interval_seconds, tz=UTC)
+    return parsed.timeframe, start, end
+
+
 class Runner:
     def __init__(
         self,
@@ -52,6 +78,7 @@ class Runner:
         broker: PaperBroker,
         risk: RiskManager,
         slug: str,
+        timeframe: Timeframe | None = None,
     ) -> None:
         self._settings = settings
         self._storage = storage
@@ -59,6 +86,10 @@ class Runner:
         self._broker = broker
         self._risk = risk
         self._slug = slug
+        # When set, run_continuously() advances self._slug to the
+        # current window on every cycle. None = explicit-URL mode
+        # (slug stays fixed for the lifetime of the runner).
+        self._timeframe = timeframe
 
     # === One cycle ===
 
@@ -229,6 +260,10 @@ class Runner:
         i = 0
         while max_iterations is None or i < max_iterations:
             i += 1
+            # Advance slug at :00/:15/:30/:45 boundaries (15m) or
+            # every 5m boundary. Without this, the bot kept polling
+            # the same expired market (bug 2026-06-06).
+            self._maybe_refresh_slug()
             try:
                 self.run_one_cycle()
                 self._settle_due_positions()
@@ -236,6 +271,20 @@ class Runner:
             except Exception as e:
                 log.exception("cycle_error err=%s", e)
             time.sleep(poll_interval_seconds)
+
+    def _maybe_refresh_slug(self) -> None:
+        """Update self._slug to the currently active window.
+
+        Only active when the runner was constructed with ``timeframe``
+        (auto-discovery mode). In explicit-URL mode, the slug stays
+        fixed and this method is a no-op.
+        """
+        if self._timeframe is None:
+            return
+        expected = current_expected_slug(self._timeframe)
+        if expected != self._slug:
+            log.info("slug_advance from=%s to=%s", self._slug, expected)
+            self._slug = expected
 
     # === Mark-to-market ===
 
@@ -277,42 +326,128 @@ class Runner:
     # === Settlement ===
 
     def _settle_due_positions(self) -> None:
+        # Include positions loaded from storage but not yet in the
+        # broker (e.g. from a previous bot run). Deduplicate by
+        # position_id to avoid double-settling.
+        seen: set[str] = set()
+        candidates: list[Any] = []
         for p in list(self._broker.open_positions):
-            # Re-discover to check resolution
-            try:
-                market, _ = discover_market(
-                    p.market_slug,
-                    timeout=self._settings.http_timeout_seconds,
-                    user_agent=self._settings.http_user_agent,
-                )
-            except Exception as e:
-                log.warning("settle_discover_failed slug=%s err=%s", p.market_slug, e)
-                continue
-            if not market.closed:
-                continue
-            final_btc = market_resolved_btc_price(market, p.round_open_price) or p.round_open_price
-            try:
-                settlement = settle_position(
-                    position=p,
-                    polymarket_resolved=market.resolved_outcome,
-                    final_btc_price=final_btc,
-                    round_close_price=final_btc,
-                )
-            except ValueError as e:
-                log.warning("settle_skipped slug=%s err=%s", p.market_slug, e)
-                continue
-            self._storage.insert_settlement(settlement)
-            settled = mark_position_settled(p)
-            self._storage.upsert_position(settled)
-            self._broker.close_position(p.market_slug, p.selected_side)
-            log.info(
-                "settled slug=%s side=%s won=%s pnl=%.4f quality=%s",
+            if p.position_id not in seen:
+                seen.add(p.position_id)
+                candidates.append(p)
+        for p in self._storage.list_open_positions():
+            if p.position_id not in seen:
+                seen.add(p.position_id)
+                candidates.append(p)
+
+        for p in candidates:
+            settled = self._try_settle_one(p)
+            if (
+                settled is not None
+                and (p.market_slug, p.selected_side) in self._broker._open
+            ):
+                self._broker.close_position(p.market_slug, p.selected_side)
+
+    def _try_settle_one(self, p: Any) -> Any:
+        """Try to settle one open position. Returns the Settlement, or None.
+
+        Strategy:
+        1. Re-discover the market via Gamma. If it returns and is closed,
+           use the resolved outcome (authoritative).
+        2. If Gamma has dropped the market (which happens ~24h after
+           the round ended) AND the round window has fully ended AND
+           the grace period has elapsed, fall back to Binance close
+           of the last 5m candle at the window boundary. This prevents
+           positions from being stuck open forever (bug 2026-06-06).
+        3. If neither source is available, leave the position open
+           and try again next cycle.
+        """
+        market = None
+        try:
+            market, _ = discover_market(
                 p.market_slug,
-                p.selected_side.value,
-                settlement.won,
-                float(settlement.realized_pnl_usd),
-                settlement.trade_quality.value,
+                timeout=self._settings.http_timeout_seconds,
+                user_agent=self._settings.http_user_agent,
             )
+        except Exception as e:
+            log.warning("settle_discover_failed slug=%s err=%s", p.market_slug, e)
+
+        if market is not None and not market.closed:
+            # Round still active in Gamma; not due yet.
+            return None
+
+        # Determine the final_btc_price.
+        final_btc: Decimal | None = None
+        resolved: Side | None = None
+        if market is not None and market.closed:
+            resolved = market.resolved_outcome
+            final_btc = (
+                market_resolved_btc_price(market, p.round_open_price)
+                or p.round_open_price
+            )
+        else:
+            # Gamma failed or returned stale data: try Binance fallback.
+            now = datetime.now(UTC)
+            try:
+                _, win_start, win_end = slug_window(p.market_slug)
+            except Exception as e:
+                log.warning(
+                    "settle_slug_parse_failed slug=%s err=%s", p.market_slug, e
+                )
+                return None
+            grace = timedelta(seconds=self._settings.binance_fallback_grace_seconds)
+            if now < win_end + grace:
+                # Window not yet fully over (or still in grace period).
+                return None
+            binance_close = fetch_5m_close_at(
+                self._settings.btc_symbol,
+                target_utc=win_end,
+                timeout=self._settings.http_timeout_seconds,
+                user_agent=self._settings.http_user_agent,
+            )
+            if binance_close is None:
+                log.warning(
+                    "settle_no_binance_fallback slug=%s win_end=%s",
+                    p.market_slug,
+                    win_end.isoformat(),
+                )
+                return None
+            final_btc = binance_close
+            # resolve_outcome derived from final_btc vs round_open (see
+            # settlement._resolve_outcome: UP if final > open, else DOWN).
+            log.info(
+                "settle_binance_fallback slug=%s round_open=%s final_btc=%s",
+                p.market_slug,
+                p.round_open_price,
+                final_btc,
+            )
+
+        if final_btc is None:
+            return None
+
+        try:
+            settlement = settle_position(
+                position=p,
+                polymarket_resolved=resolved,
+                final_btc_price=final_btc,
+                round_close_price=final_btc,
+            )
+        except ValueError as e:
+            log.warning("settle_skipped slug=%s err=%s", p.market_slug, e)
+            return None
+        self._storage.insert_settlement(settlement)
+        settled_pos = mark_position_settled(p)
+        self._storage.upsert_position(settled_pos)
+        log.info(
+            "settled slug=%s side=%s won=%s pnl=%.4f quality=%s source=%s",
+            p.market_slug,
+            p.selected_side.value,
+            settlement.won,
+            float(settlement.realized_pnl_usd),
+            settlement.trade_quality.value,
+            settlement.settlement_source.value,
+        )
+        return settlement
 
     # === Helpers ===
 

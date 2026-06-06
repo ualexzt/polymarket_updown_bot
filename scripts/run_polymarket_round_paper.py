@@ -15,7 +15,6 @@ import json
 import logging
 import sys
 import uuid
-from datetime import UTC, datetime
 from pathlib import Path
 
 # Allow running as a script from project root
@@ -26,23 +25,16 @@ from polymarket_round_bot.models import Timeframe
 from polymarket_round_bot.paper_broker import PaperBroker
 from polymarket_round_bot.probability_rules import ProbabilityRules
 from polymarket_round_bot.risk_manager import RiskManager
-from polymarket_round_bot.runner import Runner
+from polymarket_round_bot.runner import Runner, current_expected_slug
 from polymarket_round_bot.storage import Storage
 from polymarket_round_bot.url_parser import parse_market_url
 
 log = logging.getLogger("polymarket_round_bot")
 
 
-def _current_expected_slug(timeframe: Timeframe) -> str:
-    """Compute the slug of the currently active market for a timeframe.
-
-    Slug timestamp = window START (verified 2026-06-04).
-    """
-    interval_seconds = 5 * 60 if timeframe == Timeframe.M5 else 15 * 60
-    now = int(datetime.now(UTC).timestamp())
-    # Floor to nearest interval boundary
-    boundary = (now // interval_seconds) * interval_seconds
-    return f"btc-updown-{timeframe.value}-{boundary}"
+# Backward-compat re-export for tests that imported the script-local
+# helper. The canonical implementation lives in polymarket_round_bot.runner.
+_current_expected_slug = current_expected_slug
 
 
 def _resolve_slug(args: argparse.Namespace, settings: Settings) -> str:
@@ -54,7 +46,7 @@ def _resolve_slug(args: argparse.Namespace, settings: Settings) -> str:
         return parse_market_url(settings.polymarket_event_url).slug
     if settings.polymarket_event_slug:
         return parse_market_url(settings.polymarket_event_slug).slug
-    return _current_expected_slug(args.timeframe)
+    return current_expected_slug(args.timeframe)
 
 
 def _setup_logging(verbose: bool) -> None:
@@ -127,6 +119,7 @@ def main() -> int:
         broker=broker,
         risk=risk,
         slug=slug,
+        timeframe=args.timeframe if not (args.event_url or args.slug) else None,
     )
 
     try:

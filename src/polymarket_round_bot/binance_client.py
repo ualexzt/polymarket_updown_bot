@@ -113,3 +113,33 @@ def _parse_klines(data: list[list[object]], *, symbol: str, requested: int) -> B
         current_price=current_price,
         received_at_utc=received_at,
     )
+
+
+def fetch_5m_close_at(
+    symbol: str,
+    *,
+    target_utc: datetime,
+    timeout: int = 15,
+    user_agent: str = "polymarket-round-bot/0.1",
+) -> Decimal | None:
+    """Return the close of the 5m candle whose open_time <= target_utc.
+
+    Used by stale-position settlement: when Gamma no longer carries the
+    market, we use the Binance 5m close at the window boundary as the
+    authoritative "final_btc_price" for resolution.
+
+    Returns None if no candle is available (network error, very old data,
+    or target is in the future of the latest closed candle).
+    """
+    state = fetch_recent_5m_klines(
+        symbol,
+        limit=2,  # only need the candle covering target_utc
+        timeout=timeout,
+        user_agent=user_agent,
+    )
+    target_ts = target_utc.timestamp()
+    # Find the closed candle whose open_time is the latest <= target.
+    candidates = [c for c in state.candles if c.open_time_utc.timestamp() <= target_ts]
+    if not candidates:
+        return None
+    return candidates[-1].close

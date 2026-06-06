@@ -60,6 +60,12 @@ class Settings(BaseSettings):
     poly_orderbook_max_age_seconds: int = Field(default=5)
     poly_market_metadata_max_age_seconds: int = Field(default=60)
 
+    # === Stale-position settlement ===
+    # After a 15m market ends, Gamma keeps the market for ~24h. After
+    # that, we fall back to Binance close price to settle stuck
+    # positions. Grace period starts from window end.
+    binance_fallback_grace_seconds: int = Field(default=300)
+
     # === Mark intervals ===
     paper_mark_interval_seconds_5m: int = Field(default=10)
     paper_mark_interval_seconds_15m: int = Field(default=15)
