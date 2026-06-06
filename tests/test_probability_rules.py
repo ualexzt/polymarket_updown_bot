@@ -159,6 +159,38 @@ def test_no_trade_when_return_not_aligned():
     assert "return_not_aligned" in res.no_trade_reasons
 
 
+def test_no_trade_when_usable_signal_false():
+    """usable_signal=False must SKIP even when samples/prob/return_aligned pass."""
+    rule = _mk_rule(usable_signal=False, samples=200, return_aligned=True)
+    pr = ProbabilityRules([rule])
+    res = pr.lookup(
+        stage=Stage.AFTER_10M,
+        current_side=CurrentSide.ABOVE_OPEN,
+        distance_bucket=DistanceBucket.D_010_020pct,
+        volatility_bucket=VolatilityBucket.VOL_LOW,
+        pattern="normal_bull -> strong_bull_close_near_high",
+        min_samples=60,
+        min_historical_probability=Decimal("0.60"),
+    )
+    assert "usable_signal_false" in res.no_trade_reasons
+
+
+def test_usable_signal_true_passes_other_thresholds():
+    """usable_signal=True with strong stats must have empty no_trade_reasons."""
+    rule = _mk_rule(usable_signal=True, samples=200, return_aligned=True)
+    pr = ProbabilityRules([rule])
+    res = pr.lookup(
+        stage=Stage.AFTER_10M,
+        current_side=CurrentSide.ABOVE_OPEN,
+        distance_bucket=DistanceBucket.D_010_020pct,
+        volatility_bucket=VolatilityBucket.VOL_LOW,
+        pattern="normal_bull -> strong_bull_close_near_high",
+        min_samples=60,
+        min_historical_probability=Decimal("0.60"),
+    )
+    assert res.no_trade_reasons == []
+
+
 def test_load_rules_from_generated_file():
     """Verify we can load the rules file that build_state_rules.py wrote."""
     rules_path = (

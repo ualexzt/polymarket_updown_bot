@@ -19,10 +19,10 @@ from polymarket_round_bot.models import (
 from polymarket_round_bot.signal_engine import build_decision
 
 
-def _state(*, stage: Stage = Stage.AFTER_10M, pattern: str = "normal_bull -> strong_bull_close_near_high"):
+def _state(*, stage: Stage = Stage.AFTER_10M, pattern: str = "normal_bull -> strong_bull_close_near_high", seconds_to_expiry: int = 120, timeframe_override=None):
     from datetime import datetime
 
-    from polymarket_round_bot.models import Candle, RoundState
+    from polymarket_round_bot.models import Candle, RoundState, Timeframe
 
     c0 = Candle(
         open_time_utc=datetime(2024, 1, 1, 12, 0, 0, tzinfo=UTC),
@@ -34,7 +34,7 @@ def _state(*, stage: Stage = Stage.AFTER_10M, pattern: str = "normal_bull -> str
         is_closed=True,
     )
     return RoundState(
-        timeframe=__import__("polymarket_round_bot.models", fromlist=["Timeframe"]).Timeframe.M15,
+        timeframe=timeframe_override or Timeframe.M15,
         stage=stage,
         round_open_price=Decimal("100"),
         round_close_price=None,
@@ -46,7 +46,7 @@ def _state(*, stage: Stage = Stage.AFTER_10M, pattern: str = "normal_bull -> str
         prev_16_abs_return_mean=Decimal("0.0005"),
         candle_pattern=pattern,
         pattern_combo=pattern if "->" in pattern else None,
-        seconds_to_expiry=600,
+        seconds_to_expiry=seconds_to_expiry,
         c0=c0,
         c1=None,
         c2=None,
@@ -99,10 +99,10 @@ def _orderbook(*, ask: Decimal = Decimal("0.65"), bid: Decimal = Decimal("0.62")
     return PairOrderbook(up=up, down=down, received_at_utc=now)
 
 
-def _lookup(*, prob: Decimal = Decimal("0.85"), samples: int = 200, side: Side = Side.UP, no_trade: list[str] | None = None, return_aligned: bool = True):
+def _lookup(*, prob: Decimal = Decimal("0.85"), samples: int = 200, side: Side = Side.UP, no_trade: list[str] | None = None, return_aligned: bool = True, _match_type: RuleMatchType = RuleMatchType.EXACT):
     return RuleLookupResult(
         rule=None,
-        match_type=RuleMatchType.EXACT,
+        match_type=_match_type,
         historical_probability=prob,
         recommended_side=side,
         samples=samples,
@@ -124,6 +124,7 @@ def test_trade_when_ask_leq_max_buy_price():
         open_positions_count=0,
         daily_realized_pnl=Decimal("0"),
         metadata_received_at_utc=datetime.now(UTC),
+        binance_received_at_utc=datetime.now(UTC),
     )
     assert decision.decision == DecisionKind.TRADE
     assert decision.side == Side.UP
@@ -145,6 +146,7 @@ def test_skip_when_ask_above_max_buy_price():
         open_positions_count=0,
         daily_realized_pnl=Decimal("0"),
         metadata_received_at_utc=datetime.now(UTC),
+        binance_received_at_utc=datetime.now(UTC),
     )
     assert decision.decision == DecisionKind.SKIP
     assert decision.reason == "ask_above_max_buy_price"
@@ -163,6 +165,7 @@ def test_skip_when_spread_too_wide():
         open_positions_count=0,
         daily_realized_pnl=Decimal("0"),
         metadata_received_at_utc=datetime.now(UTC),
+        binance_received_at_utc=datetime.now(UTC),
     )
     assert decision.decision == DecisionKind.SKIP
     assert "spread_too_wide" in decision.reason
@@ -181,6 +184,7 @@ def test_skip_when_liquidity_too_low():
         open_positions_count=0,
         daily_realized_pnl=Decimal("0"),
         metadata_received_at_utc=datetime.now(UTC),
+        binance_received_at_utc=datetime.now(UTC),
     )
     assert decision.decision == DecisionKind.SKIP
     assert "liquidity_too_low" in decision.reason
@@ -201,6 +205,7 @@ def test_skip_when_market_inactive():
         open_positions_count=0,
         daily_realized_pnl=Decimal("0"),
         metadata_received_at_utc=datetime.now(UTC),
+        binance_received_at_utc=datetime.now(UTC),
     )
     assert decision.decision == DecisionKind.SKIP
     assert decision.reason == "market_not_active"
@@ -247,6 +252,7 @@ def test_skip_when_data_stale():
         open_positions_count=0,
         daily_realized_pnl=Decimal("0"),
         metadata_received_at_utc=now,
+        binance_received_at_utc=now,
     )
     assert decision.decision == DecisionKind.SKIP
     assert decision.reason == "stale_orderbook"
@@ -265,6 +271,7 @@ def test_skip_when_rule_filtered():
         open_positions_count=0,
         daily_realized_pnl=Decimal("0"),
         metadata_received_at_utc=datetime.now(UTC),
+        binance_received_at_utc=datetime.now(UTC),
     )
     assert decision.decision == DecisionKind.SKIP
     assert "rule_filtered" in decision.reason
@@ -283,6 +290,157 @@ def test_skip_when_risk_rejected():
         open_positions_count=1,
         daily_realized_pnl=Decimal("0"),
         metadata_received_at_utc=datetime.now(UTC),
+        binance_received_at_utc=datetime.now(UTC),
     )
     assert decision.decision == DecisionKind.SKIP
     assert "risk_rejected" in decision.reason
+
+
+# === Audit-fix gates (2026-06-06) ===
+
+
+def test_skip_when_binance_stale():
+    """Binance data older than BINANCE_PRICE_MAX_AGE_SECONDS=10 must SKIP."""
+    from datetime import timedelta
+
+    s = Settings()
+    now = datetime.now(UTC)
+    old_bn_time = now - timedelta(seconds=60)
+    decision = build_decision(
+        settings=s,
+        state=_state(),
+        market=_market(),
+        orderbook=_orderbook(),
+        lookup=_lookup(prob=Decimal("0.85")),
+        risk_allowed=True,
+        risk_reject_reason=None,
+        open_positions_count=0,
+        daily_realized_pnl=Decimal("0"),
+        metadata_received_at_utc=now,
+        binance_received_at_utc=old_bn_time,
+    )
+    assert decision.decision == DecisionKind.SKIP
+    assert decision.reason == "stale_binance_data"
+
+
+def test_skip_when_fallback_match_and_disallowed():
+    """FALLBACK_NO_PATTERN match with allow_fallback_trading=False must SKIP."""
+    s = Settings(allow_fallback_trading=False)
+    decision = build_decision(
+        settings=s,
+        state=_state(),
+        market=_market(),
+        orderbook=_orderbook(),
+        lookup=_lookup(prob=Decimal("0.85"), _match_type=RuleMatchType.FALLBACK_NO_PATTERN),
+        risk_allowed=True,
+        risk_reject_reason=None,
+        open_positions_count=0,
+        daily_realized_pnl=Decimal("0"),
+        metadata_received_at_utc=datetime.now(UTC),
+        binance_received_at_utc=datetime.now(UTC),
+    )
+    assert decision.decision == DecisionKind.SKIP
+    assert decision.reason == "fallback_rule_not_tradeable_in_v1"
+
+
+def test_trade_on_fallback_match_when_explicitly_allowed():
+    """FALLBACK match with allow_fallback_trading=True can TRADE."""
+    s = Settings(allow_fallback_trading=True)
+    decision = build_decision(
+        settings=s,
+        state=_state(),
+        market=_market(),
+        orderbook=_orderbook(),
+        lookup=_lookup(prob=Decimal("0.85"), _match_type=RuleMatchType.FALLBACK_NO_PATTERN),
+        risk_allowed=True,
+        risk_reject_reason=None,
+        open_positions_count=0,
+        daily_realized_pnl=Decimal("0"),
+        metadata_received_at_utc=datetime.now(UTC),
+        binance_received_at_utc=datetime.now(UTC),
+    )
+    assert decision.decision == DecisionKind.TRADE
+
+
+def test_skip_when_seconds_to_expiry_too_early_after_5m():
+    """AFTER_5M with sec_to_expiry < min (300) must SKIP."""
+    s = Settings()
+    decision = build_decision(
+        settings=s,
+        state=_state(stage=Stage.AFTER_5M, pattern="strong_bull_close_near_high", seconds_to_expiry=100),
+        market=_market(),
+        orderbook=_orderbook(),
+        lookup=_lookup(prob=Decimal("0.85")),
+        risk_allowed=True,
+        risk_reject_reason=None,
+        open_positions_count=0,
+        daily_realized_pnl=Decimal("0"),
+        metadata_received_at_utc=datetime.now(UTC),
+        binance_received_at_utc=datetime.now(UTC),
+    )
+    assert decision.decision == DecisionKind.SKIP
+    assert "seconds_to_expiry_out_of_range" in decision.reason
+    assert "100" in decision.reason
+
+
+def test_skip_when_seconds_to_expiry_too_late_after_10m():
+    """AFTER_10M with sec_to_expiry > max (300) must SKIP."""
+    s = Settings()
+    decision = build_decision(
+        settings=s,
+        state=_state(stage=Stage.AFTER_10M, seconds_to_expiry=500),
+        market=_market(),
+        orderbook=_orderbook(),
+        lookup=_lookup(prob=Decimal("0.85")),
+        risk_allowed=True,
+        risk_reject_reason=None,
+        open_positions_count=0,
+        daily_realized_pnl=Decimal("0"),
+        metadata_received_at_utc=datetime.now(UTC),
+        binance_received_at_utc=datetime.now(UTC),
+    )
+    assert decision.decision == DecisionKind.SKIP
+    assert "seconds_to_expiry_out_of_range" in decision.reason
+    assert "500" in decision.reason
+
+
+def test_trade_when_seconds_to_expiry_in_window():
+    """AFTER_5M with sec_to_expiry=500 (in [300, 600]) and good ask -> TRADE."""
+    s = Settings()
+    decision = build_decision(
+        settings=s,
+        state=_state(stage=Stage.AFTER_5M, pattern="strong_bull_close_near_high", seconds_to_expiry=500),
+        market=_market(),
+        orderbook=_orderbook(),
+        lookup=_lookup(prob=Decimal("0.85")),
+        risk_allowed=True,
+        risk_reject_reason=None,
+        open_positions_count=0,
+        daily_realized_pnl=Decimal("0"),
+        metadata_received_at_utc=datetime.now(UTC),
+        binance_received_at_utc=datetime.now(UTC),
+    )
+    assert decision.decision == DecisionKind.TRADE
+
+
+def test_skip_5m_when_disallowed():
+    """5m market with allow_5m_trading=False must SKIP with explicit reason."""
+    from polymarket_round_bot.models import Timeframe
+
+    s = Settings(allow_5m_trading=False)
+    decision = build_decision(
+        settings=s,
+        state=_state(timeframe_override=Timeframe.M5),
+        market=_market(),
+        orderbook=_orderbook(),
+        lookup=_lookup(prob=Decimal("0.85")),
+        risk_allowed=True,
+        risk_reject_reason=None,
+        open_positions_count=0,
+        daily_realized_pnl=Decimal("0"),
+        metadata_received_at_utc=datetime.now(UTC),
+        binance_received_at_utc=datetime.now(UTC),
+    )
+    assert decision.decision == DecisionKind.SKIP
+    assert decision.reason == "5m_trading_disabled_in_v1"
+

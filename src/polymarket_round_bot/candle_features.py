@@ -16,8 +16,6 @@ _DOJI_BODY_RATIO = Decimal("0.10")
 _SMALL_BODY_RATIO = Decimal("0.25")
 _STRONG_BODY_RATIO = Decimal("0.65")
 _LONG_WICK_RATIO = Decimal("0.45")
-_POSITION_NEAR_HIGH = Decimal("0.80")
-_POSITION_NEAR_LOW = Decimal("0.20")
 
 
 def _safe_div(num: Decimal, den: Decimal) -> Decimal:
@@ -88,10 +86,18 @@ def _classify_pattern(
     has_long_upper: bool,
     has_long_lower: bool,
 ) -> str:
-    """Single-candle pattern name (combo = 'c0 -> c1' built in round_state)."""
+    """Single-candle pattern name (combo = 'c0 -> c1' built in round_state).
+
+    Logic mirrors polymarket_round_research_v2.py::candle_pattern exactly
+    so that the rules CSV and the live classifier emit the same names.
+    """
     bull = body > _ZERO
     bear = body < _ZERO
     flat_body = body == _ZERO
+
+    # body == 0 -> "flat" (matches research, which returns "flat" for direction==0)
+    if flat_body:
+        return PatternName.FLAT.value
 
     if is_doji:
         if has_long_upper and has_long_lower:
@@ -102,30 +108,29 @@ def _classify_pattern(
             return PatternName.DOJI_LONG_LOWER_WICK.value
         return PatternName.FLAT.value
 
-    if is_strong_body and bull and close_position >= _POSITION_NEAR_HIGH:
-        return PatternName.STRONG_BULL_CLOSE_NEAR_HIGH.value
-    if is_strong_body and bear and close_position <= _POSITION_NEAR_LOW:
-        return PatternName.STRONG_BEAR_CLOSE_NEAR_LOW.value
-
-    if bull and has_long_lower:
-        return PatternName.BULL_LONG_LOWER_WICK.value
-    if bull and has_long_upper:
-        return PatternName.BULL_LONG_UPPER_WICK.value
-    if bear and has_long_lower:
-        return PatternName.BEAR_LONG_LOWER_WICK.value
-    if bear and has_long_upper:
-        return PatternName.BEAR_LONG_UPPER_WICK.value
-
-    if is_strong_body and bull:
+    if bull:
+        # Order matters: matches research (strong_bull_close_near_high
+        # requires small upper wick; wick patterns are checked before
+        # weak/normal).
+        if is_strong_body and upper_wick_to_range < Decimal("0.20"):
+            return PatternName.STRONG_BULL_CLOSE_NEAR_HIGH.value
+        if has_long_upper:
+            return PatternName.BULL_LONG_UPPER_WICK.value
+        if has_long_lower:
+            return PatternName.BULL_LONG_LOWER_WICK.value
+        if is_small_body:
+            return PatternName.WEAK_BULL.value
         return PatternName.NORMAL_BULL.value
-    if is_strong_body and bear:
+
+    if bear:
+        if is_strong_body and lower_wick_to_range < Decimal("0.20"):
+            return PatternName.STRONG_BEAR_CLOSE_NEAR_LOW.value
+        if has_long_upper:
+            return PatternName.BEAR_LONG_UPPER_WICK.value
+        if has_long_lower:
+            return PatternName.BEAR_LONG_LOWER_WICK.value
+        if is_small_body:
+            return PatternName.WEAK_BEAR.value
         return PatternName.NORMAL_BEAR.value
 
-    if is_small_body and bull:
-        return PatternName.WEAK_BULL.value
-    if is_small_body and bear:
-        return PatternName.WEAK_BEAR.value
-
-    if flat_body:
-        return PatternName.FLAT.value
     return PatternName.FLAT.value

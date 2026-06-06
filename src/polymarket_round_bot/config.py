@@ -52,6 +52,24 @@ class Settings(BaseSettings):
     allow_after_5m: bool = Field(default=True)
     allow_after_10m: bool = Field(default=True)
 
+    # === Timeframe gates ===
+    # 5m markets have no calibrated rules in v1; explicit gate to
+    # surface this in skip_reason (default off).
+    allow_5m_trading: bool = Field(default=False)
+
+    # === Rule trading restriction (v1) ===
+    # v1 trades only on EXACT match. Fallback matches are logged
+    # but never traded.
+    allow_fallback_trading: bool = Field(default=False)
+
+    # === Seconds-to-expiry windows ===
+    # 15m round = 900s total. AFTER_5M stage starts ~5min in (sec_to_expiry=600),
+    # AFTER_10M stage starts ~10min in (sec_to_expiry=300).
+    min_seconds_to_expiry_15m_after_5m: int = Field(default=300)
+    max_seconds_to_expiry_15m_after_5m: int = Field(default=600)
+    min_seconds_to_expiry_15m_after_10m: int = Field(default=60)
+    max_seconds_to_expiry_15m_after_10m: int = Field(default=300)
+
     # === Paper bankroll ===
     paper_starting_balance_usd: Decimal = Field(default=Decimal("100"))
 

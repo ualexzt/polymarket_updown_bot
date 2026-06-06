@@ -5,16 +5,26 @@ TRADE / SKIP decision. Risk checks are folded in via the RiskManager
 dependency.
 
 Entry conditions (all must be true for TRADE):
+  - timeframe allowed (15m yes; 5m only if allow_5m_trading=True)
+  - stage allowed (AFTER_5M and/or AFTER_10M per settings)
   - market.active and not market.closed and market.accepting_orders
+  - Binance data not stale (<= BINANCE_PRICE_MAX_AGE_SECONDS)
+  - at least one in-round candle (no_in_round_candle)
+  - orderbook not stale (<= POLY_ORDERBOOK_MAX_AGE_SECONDS)
+  - metadata not stale (<= POLY_MARKET_METADATA_MAX_AGE_SECONDS)
+  - rule.usable_signal == True (post-2026-06-06 audit)
+  - rule.samples >= MIN_SAMPLES
+  - rule.historical_probability >= MIN_HISTORICAL_PROBABILITY
+  - rule.return_aligned
+  - rule.match_type == EXACT (v1; allow_fallback_trading=False by default)
+  - seconds_to_expiry in stage-specific window (15m only)
   - selected_best_ask in (0, 1)
   - selected_best_ask <= max_buy_price (= fair_price - safety_buffer)
   - edge_vs_ask >= MIN_EDGE
   - selected_spread <= MAX_SPREAD
   - liquidity_usd_estimate >= MIN_LIQUIDITY_USD
-  - rule has samples >= MIN_SAMPLES and historical_probability >= MIN_HISTORICAL_PROBABILITY
-  - rule.return_aligned
-  - data not stale (Binance + orderbook + metadata)
-  - risk allowed
+  - ask size sufficient for requested bet
+  - risk allowed (max_open_positions, daily_loss, duplicate)
 """
 from __future__ import annotations
 
@@ -29,9 +39,11 @@ from .models import (
     PairOrderbook,
     RoundState,
     RuleLookupResult,
+    RuleMatchType,
     Side,
     SignalDecision,
     Stage,
+    Timeframe,
 )
 
 
@@ -68,6 +80,7 @@ def build_decision(
     open_positions_count: int,
     daily_realized_pnl: Decimal,
     metadata_received_at_utc: datetime,
+    binance_received_at_utc: datetime,
     now_utc: datetime | None = None,
 ) -> SignalDecision:
     """Pure function: produce a TRADE or SKIP decision from inputs."""
@@ -93,6 +106,17 @@ def build_decision(
             size_usd=settings.max_position_usd,
         )
 
+    # 5m timeframe gate (v1 has no calibrated 5m rules)
+    if state.timeframe == Timeframe.M5 and not settings.allow_5m_trading:
+        return _skip(
+            state=state,
+            market=market,
+            orderbook=orderbook,
+            lookup=lookup,
+            reason="5m_trading_disabled_in_v1",
+            size_usd=settings.max_position_usd,
+        )
+
     # Market status
     if not market.active:
         return _skip(state, market, orderbook, lookup, "market_not_active", settings.max_position_usd)
@@ -102,9 +126,10 @@ def build_decision(
         return _skip(state, market, orderbook, lookup, "market_not_accepting_orders", settings.max_position_usd)
 
     # Freshness
-    # We don't need the binance age here directly — the round state
-    # already incorporates Binance data. We just need to ensure we
-    # have at least one in-round candle to compute round_open.
+    bn_age = _age_seconds(now, binance_received_at_utc)
+    if bn_age > Decimal(settings.binance_price_max_age_seconds):
+        return _skip(state, market, orderbook, lookup, "stale_binance_data", settings.max_position_usd)
+
     if state.c0 is None and state.c1 is None:
         return _skip(state, market, orderbook, lookup, "no_in_round_candle", settings.max_position_usd)
 
@@ -129,6 +154,49 @@ def build_decision(
 
     if lookup.recommended_side is None or lookup.historical_probability is None:
         return _skip(state, market, orderbook, lookup, "no_rule_for_state", settings.max_position_usd)
+
+    # EXACT-only trading in v1. Fallback matches are surfaced in
+    # match_type for inspection but never produce a TRADE.
+    if lookup.match_type != RuleMatchType.EXACT and not settings.allow_fallback_trading:
+        return _skip(
+            state,
+            market,
+            orderbook,
+            lookup,
+            "fallback_rule_not_tradeable_in_v1",
+            settings.max_position_usd,
+            lookup.recommended_side,
+            None,
+        )
+
+    # Seconds-to-expiry window (15m only; 5m is gated above).
+    if state.timeframe == Timeframe.M15:
+        window: tuple[int, int] | None
+        if state.stage == Stage.AFTER_5M:
+            window = (
+                settings.min_seconds_to_expiry_15m_after_5m,
+                settings.max_seconds_to_expiry_15m_after_5m,
+            )
+        elif state.stage == Stage.AFTER_10M:
+            window = (
+                settings.min_seconds_to_expiry_15m_after_10m,
+                settings.max_seconds_to_expiry_15m_after_10m,
+            )
+        else:
+            window = None
+        if window is not None:
+            lo, hi = window
+            if state.seconds_to_expiry < lo or state.seconds_to_expiry > hi:
+                return _skip(
+                    state,
+                    market,
+                    orderbook,
+                    lookup,
+                    f"seconds_to_expiry_out_of_range:{state.seconds_to_expiry}_not_in_[{lo},{hi}]",
+                    settings.max_position_usd,
+                    lookup.recommended_side,
+                    None,
+                )
 
     side = _select_side_for_observation(state, lookup)
     if side is None:

@@ -205,6 +205,7 @@ class Runner:
             open_positions_count=risk_decision.open_positions_count,
             daily_realized_pnl=daily_pnl,
             metadata_received_at_utc=datetime.now(UTC),
+            binance_received_at_utc=binance.received_at_utc,
             now_utc=now,
         )
         log.info("decision=%s reason=%s", decision.decision.value, decision.reason)

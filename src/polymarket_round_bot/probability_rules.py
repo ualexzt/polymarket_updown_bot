@@ -12,6 +12,7 @@ Lookup hierarchy:
   4. NO_MATCH (no rule for this state)
 
 No-trade conditions (always enforced):
+  - usable_signal != true
   - samples < MIN_SAMPLES
   - historical_probability < MIN_HISTORICAL_PROBABILITY
   - return_aligned != true
@@ -176,6 +177,8 @@ class ProbabilityRules:
                 no_trade_reasons=no_trade_reasons,
             )
 
+        if not rule.usable_signal:
+            no_trade_reasons.append("usable_signal_false")
         if rule.samples < min_samples:
             no_trade_reasons.append(
                 f"samples_below_threshold:{rule.samples}<{min_samples}"
