@@ -20,6 +20,7 @@ Entry conditions (all must be true for TRADE):
   - seconds_to_expiry in stage-specific window (15m only)
   - selected_best_ask in (0, 1)
   - selected_best_ask <= max_buy_price (= fair_price - safety_buffer)
+  - selected_best_ask <= max_entry_ask (absolute cap, default 0.80)
   - edge_vs_ask >= MIN_EDGE
   - selected_spread <= MAX_SPREAD
   - liquidity_usd_estimate >= MIN_LIQUIDITY_USD
@@ -230,6 +231,24 @@ def build_decision(
             orderbook,
             lookup,
             "ask_above_max_buy_price",
+            settings.max_position_usd,
+            side,
+            token_id,
+            fair_price=fair_price,
+            max_buy_price=max_buy_price,
+            market_ask=best_ask,
+            edge_vs_ask=edge_vs_ask,
+        )
+    if best_ask > settings.max_entry_ask:
+        # Absolute cap independent of fair_price. Protects against
+        # overfit rules where hist_prob is high but the implied WR
+        # needed to break even at the ask is not actually met live.
+        return _skip(
+            state,
+            market,
+            orderbook,
+            lookup,
+            f"ask_above_max_entry_ask:{best_ask}>{settings.max_entry_ask}",
             settings.max_position_usd,
             side,
             token_id,

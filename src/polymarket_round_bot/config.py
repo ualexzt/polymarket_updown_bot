@@ -36,15 +36,25 @@ class Settings(BaseSettings):
     polymarket_event_slug: str = Field(default="")
 
     # === Value entry thresholds ===
-    safety_buffer: Decimal = Field(default=Decimal("0.04"))
-    min_edge: Decimal = Field(default=Decimal("0.04"))
+    # strict v1 (aligned with polymarket_round_research_v2.py defaults):
+    # min_edge == safety_buffer == 0.05 so the two checks collapse into
+    # one: trade only if ask <= historical_probability - 0.05.
+    safety_buffer: Decimal = Field(default=Decimal("0.05"))
+    min_edge: Decimal = Field(default=Decimal("0.05"))
+    # Cap on absolute ask price. Rules with hist_prob >= 0.90 require
+    # WR > 90% to break even at entry 0.85+, which backtest showed
+    # overfit. Forbid asks above this cap in v1.
+    max_entry_ask: Decimal = Field(default=Decimal("0.80"))
     max_spread: Decimal = Field(default=Decimal("0.03"))
     min_liquidity_usd: Decimal = Field(default=Decimal("25"))
     min_historical_probability: Decimal = Field(default=Decimal("0.60"))
     min_samples: int = Field(default=60)
 
     # === Position / risk caps ===
-    max_position_usd: Decimal = Field(default=Decimal("5"))
+    # Strict paper v1: $1 per trade so a 24-trade day cannot exceed
+    # $24 of theoretical max loss, and the daily_loss cap of $10
+    # actually constrains behaviour instead of being the floor.
+    max_position_usd: Decimal = Field(default=Decimal("1"))
     max_daily_loss_usd: Decimal = Field(default=Decimal("10"))
     max_open_positions: int = Field(default=1)
 

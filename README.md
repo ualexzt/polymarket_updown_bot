@@ -169,13 +169,14 @@ See `.env.example` for the full list. Key parameters:
 |---|---|---|
 | `BOT_MODE` | `paper` | v1 only supports `paper` |
 | `BTC_SYMBOL` | `BTCUSDT` | Binance symbol |
-| `SAFETY_BUFFER` | `0.04` | subtract from `fair_price` to get `max_buy_price` |
-| `MIN_EDGE` | `0.04` | minimum `fair_price - ask` for TRADE |
+| `SAFETY_BUFFER` | `0.05` | subtract from `fair_price` to get `max_buy_price` |
+| `MIN_EDGE` | `0.05` | minimum `fair_price - ask` for TRADE |
+| `MAX_ENTRY_ASK` | `0.80` | absolute cap on ask; forbids overfit high-prob rules |
 | `MAX_SPREAD` | `0.03` | maximum bid-ask spread for TRADE |
 | `MIN_LIQUIDITY_USD` | `25` | minimum top-5 depth for TRADE |
 | `MIN_HISTORICAL_PROBABILITY` | `0.60` | minimum rule probability for TRADE |
 | `MIN_SAMPLES` | `60` | minimum rule sample count for TRADE |
-| `MAX_POSITION_USD` | `5` | PAPER position size |
+| `MAX_POSITION_USD` | `1` | PAPER position size (strict v1) |
 | `MAX_OPEN_POSITIONS` | `1` | global open-position cap |
 | `MAX_DAILY_LOSS_USD` | `10` | daily realised PnL floor |
 

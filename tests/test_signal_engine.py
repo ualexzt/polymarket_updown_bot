@@ -111,8 +111,8 @@ def _lookup(*, prob: Decimal = Decimal("0.85"), samples: int = 200, side: Side =
 
 
 def test_trade_when_ask_leq_max_buy_price():
-    s = Settings()  # safety_buffer=0.04, min_edge=0.04
-    # fair=0.85, safety=0.04 -> max_buy=0.81, ask=0.65 -> edge=0.20 -> TRADE
+    s = Settings()  # safety_buffer=0.05, min_edge=0.05
+    # fair=0.85, safety=0.05 -> max_buy=0.80, ask=0.65 -> edge=0.20 -> TRADE
     decision = build_decision(
         settings=s,
         state=_state(),
@@ -128,13 +128,13 @@ def test_trade_when_ask_leq_max_buy_price():
     )
     assert decision.decision == DecisionKind.TRADE
     assert decision.side == Side.UP
-    assert decision.max_buy_price == Decimal("0.81")
+    assert decision.max_buy_price == Decimal("0.80")
     assert decision.edge_vs_ask == Decimal("0.20")
 
 
 def test_skip_when_ask_above_max_buy_price():
     s = Settings()
-    # fair=0.85, safety=0.04 -> max_buy=0.81, ask=0.85 -> edge=0 -> SKIP
+    # fair=0.85, safety=0.05 -> max_buy=0.80, ask=0.85 -> edge=0 -> SKIP
     decision = build_decision(
         settings=s,
         state=_state(),
@@ -150,6 +150,106 @@ def test_skip_when_ask_above_max_buy_price():
     )
     assert decision.decision == DecisionKind.SKIP
     assert decision.reason == "ask_above_max_buy_price"
+
+
+def test_skip_when_edge_below_min_5c():
+    """MIN_EDGE is an independent gate: with safety_buffer=0.04 but
+    min_edge=0.05, an ask of 0.79 against fair 0.83 has edge=0.04
+    which passes max_buy (= 0.79) but fails min_edge (= 0.05).
+
+    Note: in production v1 both safety_buffer and min_edge are 0.05,
+    so the two checks collapse to one and edge_below_min is never
+    the binding constraint. This test pins down that the independent
+    gate still works when they differ.
+    """
+    s = Settings(safety_buffer=Decimal("0.04"), min_edge=Decimal("0.05"))
+    decision = build_decision(
+        settings=s,
+        state=_state(),
+        market=_market(),
+        orderbook=_orderbook(ask=Decimal("0.79"), bid=Decimal("0.76")),
+        lookup=_lookup(prob=Decimal("0.83")),
+        risk_allowed=True,
+        risk_reject_reason=None,
+        open_positions_count=0,
+        daily_realized_pnl=Decimal("0"),
+        metadata_received_at_utc=datetime.now(UTC),
+        binance_received_at_utc=datetime.now(UTC),
+    )
+    assert decision.decision == DecisionKind.SKIP
+    assert "edge_below_min" in decision.reason
+
+
+def test_v1_collapse_max_buy_and_min_edge_when_equal():
+    """At strict v1 (safety=min_edge=0.05), an ask of 0.80 with fair
+    0.85 produces max_buy=0.80 and edge=0.05, both exactly at
+    threshold. Must TRADE. Confirms the two checks collapse to one
+    condition without leaving a tiny dead zone.
+    """
+    s = Settings()  # both = 0.05
+    decision = build_decision(
+        settings=s,
+        state=_state(),
+        market=_market(),
+        orderbook=_orderbook(ask=Decimal("0.80"), bid=Decimal("0.77")),
+        lookup=_lookup(prob=Decimal("0.85")),
+        risk_allowed=True,
+        risk_reject_reason=None,
+        open_positions_count=0,
+        daily_realized_pnl=Decimal("0"),
+        metadata_received_at_utc=datetime.now(UTC),
+        binance_received_at_utc=datetime.now(UTC),
+    )
+    assert decision.decision == DecisionKind.TRADE
+    assert decision.max_buy_price == Decimal("0.80")
+    assert decision.edge_vs_ask == Decimal("0.05")
+
+
+def test_skip_when_ask_above_max_entry_ask():
+    """Absolute cap: even with great edge, an ask above max_entry_ask
+    (default 0.80) is forbidden. Protects against overfit high-prob
+    rules where 0.85+ asks are tempting but break-even WR is too
+    high to actually achieve live.
+    """
+    s = Settings()  # max_entry_ask=0.80
+    # fair=0.95, ask=0.85 -> max_buy=0.90 passes, edge=0.10 passes
+    # but ask > max_entry_ask=0.80 -> SKIP
+    decision = build_decision(
+        settings=s,
+        state=_state(),
+        market=_market(),
+        orderbook=_orderbook(ask=Decimal("0.85"), bid=Decimal("0.82")),
+        lookup=_lookup(prob=Decimal("0.95")),
+        risk_allowed=True,
+        risk_reject_reason=None,
+        open_positions_count=0,
+        daily_realized_pnl=Decimal("0"),
+        metadata_received_at_utc=datetime.now(UTC),
+        binance_received_at_utc=datetime.now(UTC),
+    )
+    assert decision.decision == DecisionKind.SKIP
+    assert "ask_above_max_entry_ask" in decision.reason
+
+
+def test_trade_at_max_entry_ask_boundary():
+    """Sanity: ask exactly at max_entry_ask is allowed (<=)."""
+    s = Settings()  # max_entry_ask=0.80
+    # fair=0.85, ask=0.80 -> max_buy=0.80, ask==max_buy, edge=0.05
+    decision = build_decision(
+        settings=s,
+        state=_state(),
+        market=_market(),
+        orderbook=_orderbook(ask=Decimal("0.80"), bid=Decimal("0.77")),
+        lookup=_lookup(prob=Decimal("0.85")),
+        risk_allowed=True,
+        risk_reject_reason=None,
+        open_positions_count=0,
+        daily_realized_pnl=Decimal("0"),
+        metadata_received_at_utc=datetime.now(UTC),
+        binance_received_at_utc=datetime.now(UTC),
+    )
+    assert decision.decision == DecisionKind.TRADE
+    assert decision.max_buy_price == Decimal("0.80")
 
 
 def test_skip_when_spread_too_wide():
