@@ -339,6 +339,94 @@ class Storage:
             rows = conn.execute("SELECT * FROM paper_positions").fetchall()
         return [PaperPosition.model_validate(dict(r)) for r in rows]
 
+    # === Audit queries (defence-in-depth, 2026-06-07) ===
+
+    def audit_duplicates(self) -> dict[str, list[dict[str, Any]]]:
+        """Find potential duplicate positions.
+
+        Returns three lists:
+        - open_by_market: market_slug with >1 OPEN positions (should be empty
+          after the 2026-06-07 fix; surfaces lingering duplicates from earlier
+          runs).
+        - lifetime_by_market: market_slug with >1 paper_positions rows across
+          all statuses (lifetime duplicates — these are the rows that would
+          have prevented the partial unique index from being created on a
+          legacy DB).
+        - rapid_trade_decisions: pairs of TRADE decisions on the same slug
+          whose timestamps differ by <5 seconds (signals a near-race).
+        """
+        result: dict[str, list[dict[str, Any]]] = {
+            "open_by_market": [],
+            "lifetime_by_market": [],
+            "rapid_trade_decisions": [],
+        }
+        with self._conn() as conn:
+            for row in conn.execute(
+                """
+                SELECT market_slug, COUNT(*) AS n
+                FROM paper_positions
+                WHERE status = 'OPEN'
+                GROUP BY market_slug
+                HAVING n > 1
+                ORDER BY n DESC
+                """
+            ).fetchall():
+                result["open_by_market"].append(
+                    {"market_slug": row["market_slug"], "open_count": row["n"]}
+                )
+            for row in conn.execute(
+                """
+                SELECT market_slug, COUNT(*) AS n,
+                       SUM(CASE WHEN status = 'OPEN' THEN 1 ELSE 0 END) AS open_n
+                FROM paper_positions
+                GROUP BY market_slug
+                HAVING n > 1
+                ORDER BY n DESC
+                """
+            ).fetchall():
+                result["lifetime_by_market"].append(
+                    {
+                        "market_slug": row["market_slug"],
+                        "total_count": row["n"],
+                        "open_count": row["open_n"],
+                    }
+                )
+            # Rapid TRADE decisions: <5 seconds apart on the same slug.
+            for row in conn.execute(
+                """
+                WITH ranked AS (
+                  SELECT decision_id, market_slug, timestamp_utc,
+                         LAG(timestamp_utc) OVER (
+                           PARTITION BY market_slug ORDER BY timestamp_utc
+                         ) AS prev_ts,
+                         LAG(decision_id) OVER (
+                           PARTITION BY market_slug ORDER BY timestamp_utc
+                         ) AS prev_id
+                  FROM decisions
+                  WHERE decision = 'TRADE'
+                )
+                SELECT decision_id, market_slug, timestamp_utc,
+                       prev_id, prev_ts,
+                       (julianday(timestamp_utc) - julianday(prev_ts)) * 86400.0
+                         AS seconds_apart
+                FROM ranked
+                WHERE prev_ts IS NOT NULL
+                  AND (julianday(timestamp_utc) - julianday(prev_ts)) * 86400.0 < 5
+                ORDER BY timestamp_utc
+                """
+            ).fetchall():
+                result["rapid_trade_decisions"].append(
+                    {
+                        "decision_id": row["decision_id"],
+                        "market_slug": row["market_slug"],
+                        "timestamp_utc": row["timestamp_utc"],
+                        "previous_decision_id": row["prev_id"],
+                        "previous_timestamp_utc": row["prev_ts"],
+                        "seconds_apart": row["seconds_apart"],
+                    }
+                )
+        return result
+
     # === Mark-to-market ===
 
     def insert_mtm(self, mtm: MarkToMarket) -> None:

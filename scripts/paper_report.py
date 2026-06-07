@@ -29,7 +29,9 @@ def main() -> int:
     summary = paper_summary(storage, since=args.since)
 
     if args.json:
-        print(json.dumps(summary, indent=2, default=str))
+        payload = dict(summary)
+        payload["audit"] = storage.audit_duplicates()
+        print(json.dumps(payload, indent=2, default=str))
         return 0
 
     print(f"=== Paper report (since={args.since or 'all'}) ===")
@@ -77,6 +79,33 @@ def main() -> int:
     if summary["worst_trade"]:
         wt = summary["worst_trade"]
         print(f"worst_trade : pos={wt['position_id']} slug={wt['market_slug']} pnl={wt['pnl']:.4f}")
+    print()
+    print("--- audit: duplicate positions ---")
+    audit = storage.audit_duplicates()
+    obm = audit["open_by_market"]
+    lbm = audit["lifetime_by_market"]
+    rtd = audit["rapid_trade_decisions"]
+    if not obm and not lbm and not rtd:
+        print("  CLEAN: no duplicate positions, no rapid TRADE decisions.")
+    else:
+        if obm:
+            print(f"  markets with >1 OPEN positions ({len(obm)}):")
+            for d in obm:
+                print(f"    {d['market_slug']}: {d['open_count']} OPEN rows")
+        if lbm:
+            print(f"  markets with >1 lifetime positions ({len(lbm)}):")
+            for d in lbm:
+                print(
+                    f"    {d['market_slug']}: total={d['total_count']} "
+                    f"open={d['open_count']}"
+                )
+        if rtd:
+            print(f"  rapid TRADE decisions <5s apart ({len(rtd)}):")
+            for d in rtd:
+                print(
+                    f"    {d['market_slug']} {d['timestamp_utc']} "
+                    f"({d['seconds_apart']:.2f}s after {d['previous_decision_id']})"
+                )
     return 0
 
 
