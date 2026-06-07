@@ -25,7 +25,7 @@ from .models import (
     Stage,
     Timeframe,
 )
-from .paper_broker import PaperBroker
+from .paper_broker import PaperBroker, PaperBrokerError
 from .polymarket_clob_client import fetch_pair_orderbook, levels_to_json
 from .polymarket_discovery import discover_market
 from .probability_rules import ProbabilityRules
@@ -168,7 +168,17 @@ class Runner:
         )
 
         # 6. Risk
-        open_positions = [(p.market_slug, p.selected_side) for p in self._broker.open_positions]
+        # Build the open-positions list from BOTH the in-memory broker
+        # AND persistent storage. The storage list is critical for
+        # restart safety: if the bot was restarted, _broker._open is
+        # empty but storage still holds any OPEN position, and a new
+        # trade on that slug must be rejected. Deduped by (slug, side).
+        open_positions_set: set[tuple[str, Side]] = set()
+        for p in self._broker.open_positions:
+            open_positions_set.add((p.market_slug, p.selected_side))
+        for p in self._storage.list_open_positions():
+            open_positions_set.add((p.market_slug, p.selected_side))
+        open_positions = list(open_positions_set)
         # Daily realised PnL = sum of today's settlements
         today_iso = now.date().isoformat()
         daily_pnl = self._daily_realized_pnl(today_iso)
@@ -212,8 +222,8 @@ class Runner:
 
         # 8. Open position if TRADE
         if decision.decision == DecisionKind.TRADE and decision.side is not None:
+            sel_ob = pair.up if decision.side == Side.UP else pair.down
             try:
-                sel_ob = pair.up if decision.side == Side.UP else pair.down
                 self._broker.open_position(
                     decision,
                     round_open_price=state.round_open_price,
@@ -225,8 +235,20 @@ class Runner:
                     seconds_to_expiry=state.seconds_to_expiry,
                     entry_best_bid=sel_ob.best_bid or decision.market_ask or Decimal("0"),
                 )
-            except Exception as e:  # broker error
+            except PaperBrokerError as e:
+                # Strict v1: if the broker rejects (e.g. duplicate
+                # position, edge case the risk check missed), convert
+                # the decision to SKIP and persist it. The phantom
+                # "TRADE in DB with no position" bug 2026-06-07 must
+                # not happen again.
+                log.warning("paper_broker_rejected err=%s", e)
+                decision.decision = DecisionKind.SKIP
+                decision.reason = f"paper_broker_rejected:{e}"
+            except Exception as e:
+                # Non-PaperBrokerError: log and re-raise so the cycle
+                # loop catches it. Don't silently swallow.
                 log.error("open_position_failed err=%s", e)
+                raise
 
         # 9. Snapshot + persist
         snap = self._build_snapshot(

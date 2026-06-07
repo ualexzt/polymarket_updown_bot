@@ -9,6 +9,7 @@ Timestamps stored as ISO 8601 UTC.
 """
 from __future__ import annotations
 
+import logging
 import sqlite3
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -24,6 +25,8 @@ from .models import (
     PositionStatus,
     Settlement,
 )
+
+log = logging.getLogger("polymarket_round_bot.storage")
 
 SCHEMA: str = """
 CREATE TABLE IF NOT EXISTS markets (
@@ -224,6 +227,27 @@ class Storage:
     def _init_schema(self) -> None:
         with self._conn() as conn:
             conn.executescript(SCHEMA)
+            # Defense-in-depth: partial unique index ensures no two
+            # rows with status='OPEN' share the same market_slug.
+            # If pre-existing duplicates are in the DB (e.g. created
+            # by the pre-fix bot 2026-06-06), the CREATE will fail;
+            # we log and continue. A future audit/cleanup pass can
+            # remove the duplicates and re-create the index.
+            try:
+                conn.execute(
+                    """
+                    CREATE UNIQUE INDEX IF NOT EXISTS
+                        uq_open_position_market
+                    ON paper_positions(market_slug)
+                    WHERE status = 'OPEN'
+                    """
+                )
+            except Exception as e:  # IntegrityError on duplicate data
+                # Non-fatal: risk-manager + storage-list checks
+                # already prevent new duplicates.
+                log.warning(
+                    "uq_open_position_market_index_skipped err=%s", e
+                )
 
     # === Bot runs ===
 
