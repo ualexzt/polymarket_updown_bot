@@ -104,6 +104,14 @@ class Settings(BaseSettings):
     )
     database_path: str = Field(default="data/polymarket_round_paper.sqlite")
 
+    # === Telegram reports ===
+    telegram_reports_enabled: bool = Field(default=True)
+    telegram_bot_token: str = Field(default="")
+    telegram_chat_id: str = Field(default="")
+    # Local Kyiv hours when a small trading report should be sent.
+    telegram_report_hours_kyiv: str = Field(default="8,20")
+    telegram_report_state_path: str = Field(default="data/telegram_report_state.json")
+
     # === HTTP ===
     http_timeout_seconds: int = Field(default=15)
     http_user_agent: str = Field(default="polymarket-round-bot/0.1")
@@ -123,3 +131,7 @@ class Settings(BaseSettings):
     @property
     def database_file(self) -> Path:
         return self.resolve("database_path")
+
+    @property
+    def telegram_report_state_file(self) -> Path:
+        return self.resolve("telegram_report_state_path")

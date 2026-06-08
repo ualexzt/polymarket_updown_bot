@@ -34,6 +34,7 @@ from .round_state import build_round_state
 from .settlement import mark_position_settled, settle_position
 from .signal_engine import build_decision
 from .storage import Storage
+from .telegram_reports import TelegramReportService
 from .url_parser import UrlParserError, parse_market_url
 
 log = logging.getLogger("polymarket_round_bot")
@@ -90,6 +91,7 @@ class Runner:
         # current window on every cycle. None = explicit-URL mode
         # (slug stays fixed for the lifetime of the runner).
         self._timeframe = timeframe
+        self._telegram_reports = TelegramReportService(settings, storage)
 
     # === One cycle ===
 
@@ -293,6 +295,11 @@ class Runner:
                 self._mark_open_positions()
             except Exception as e:
                 log.exception("cycle_error err=%s", e)
+            try:
+                if self._telegram_reports.maybe_send():
+                    log.info("telegram_report_sent")
+            except Exception as e:
+                log.exception("telegram_report_error err=%s", e)
             time.sleep(poll_interval_seconds)
 
     def _maybe_refresh_slug(self) -> None:

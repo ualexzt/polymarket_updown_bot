@@ -21,6 +21,7 @@ import json
 import sys
 from decimal import Decimal
 from pathlib import Path
+from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
@@ -103,7 +104,7 @@ def main() -> int:
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
     tf = Timeframe(args.timeframe)
-    rules: list[dict] = []
+    rules: list[dict[str, Any]] = []
     with csv_path.open("r", encoding="utf-8") as f:
         reader = csv.DictReader(f)
         for row in reader:
