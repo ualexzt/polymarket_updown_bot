@@ -523,6 +523,45 @@ def test_trade_when_seconds_to_expiry_in_window():
     assert decision.decision == DecisionKind.TRADE
 
 
+def test_skip_late_after_5m_down_entry():
+    """DOWN entries after 6m into the 15m round are disabled in paper v1."""
+    s = Settings()
+    decision = build_decision(
+        settings=s,
+        state=_state(stage=Stage.AFTER_5M, pattern="strong_bull_close_near_high", seconds_to_expiry=500),
+        market=_market(),
+        orderbook=_orderbook(),
+        lookup=_lookup(prob=Decimal("0.85"), side=Side.DOWN),
+        risk_allowed=True,
+        risk_reject_reason=None,
+        open_positions_count=0,
+        daily_realized_pnl=Decimal("0"),
+        metadata_received_at_utc=datetime.now(UTC),
+        binance_received_at_utc=datetime.now(UTC),
+    )
+    assert decision.decision == DecisionKind.SKIP
+    assert decision.reason == "late_down_after_5m_window:500<540"
+
+
+def test_trade_early_after_5m_down_entry():
+    """DOWN remains allowed in the first minute after c0 closes."""
+    s = Settings()
+    decision = build_decision(
+        settings=s,
+        state=_state(stage=Stage.AFTER_5M, pattern="strong_bull_close_near_high", seconds_to_expiry=571),
+        market=_market(),
+        orderbook=_orderbook(),
+        lookup=_lookup(prob=Decimal("0.85"), side=Side.DOWN),
+        risk_allowed=True,
+        risk_reject_reason=None,
+        open_positions_count=0,
+        daily_realized_pnl=Decimal("0"),
+        metadata_received_at_utc=datetime.now(UTC),
+        binance_received_at_utc=datetime.now(UTC),
+    )
+    assert decision.decision == DecisionKind.TRADE
+
+
 def test_skip_5m_when_disallowed():
     """5m market with allow_5m_trading=False must SKIP with explicit reason."""
     from polymarket_round_bot.models import Timeframe

@@ -47,6 +47,8 @@ from .models import (
     Timeframe,
 )
 
+_MIN_DOWN_SECONDS_TO_EXPIRY_AFTER_5M = 540
+
 
 def _age_seconds(now: datetime, then: datetime) -> Decimal:
     return Decimal(str(max(0.0, (now - then).total_seconds())))
@@ -202,6 +204,23 @@ def build_decision(
     side = _select_side_for_observation(state, lookup)
     if side is None:
         return _skip(state, market, orderbook, lookup, "no_recommended_side", settings.max_position_usd)
+
+    if (
+        state.timeframe == Timeframe.M15
+        and state.stage == Stage.AFTER_5M
+        and side == Side.DOWN
+        and state.seconds_to_expiry < _MIN_DOWN_SECONDS_TO_EXPIRY_AFTER_5M
+    ):
+        return _skip(
+            state,
+            market,
+            orderbook,
+            lookup,
+            f"late_down_after_5m_window:{state.seconds_to_expiry}<{_MIN_DOWN_SECONDS_TO_EXPIRY_AFTER_5M}",
+            settings.max_position_usd,
+            side,
+            None,
+        )
 
     # Pick the orderbook for the selected side
     selected_ob = _select_orderbook_for_side(orderbook, side, market)
