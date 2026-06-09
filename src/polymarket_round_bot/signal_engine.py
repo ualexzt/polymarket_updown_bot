@@ -21,6 +21,7 @@ Entry conditions (all must be true for TRADE):
   - selected_best_ask in (0, 1)
   - selected_best_ask <= max_buy_price (= fair_price - safety_buffer)
   - selected_best_ask <= max_entry_ask (absolute cap, default 0.80)
+  - DOWN selected_best_ask in [0.55, 0.70) for paper forward test
   - edge_vs_ask >= MIN_EDGE
   - selected_spread <= MAX_SPREAD
   - liquidity_usd_estimate >= MIN_LIQUIDITY_USD
@@ -48,6 +49,8 @@ from .models import (
 )
 
 _MIN_DOWN_SECONDS_TO_EXPIRY_AFTER_5M = 540
+_MIN_DOWN_ENTRY_ASK = Decimal("0.55")
+_MAX_DOWN_ENTRY_ASK = Decimal("0.70")
 
 
 def _age_seconds(now: datetime, then: datetime) -> Decimal:
@@ -268,6 +271,36 @@ def build_decision(
             orderbook,
             lookup,
             f"ask_above_max_entry_ask:{best_ask}>{settings.max_entry_ask}",
+            settings.max_position_usd,
+            side,
+            token_id,
+            fair_price=fair_price,
+            max_buy_price=max_buy_price,
+            market_ask=best_ask,
+            edge_vs_ask=edge_vs_ask,
+        )
+    if side == Side.DOWN and best_ask < _MIN_DOWN_ENTRY_ASK:
+        return _skip(
+            state,
+            market,
+            orderbook,
+            lookup,
+            f"down_entry_ask_below_min:{best_ask}<{_MIN_DOWN_ENTRY_ASK}",
+            settings.max_position_usd,
+            side,
+            token_id,
+            fair_price=fair_price,
+            max_buy_price=max_buy_price,
+            market_ask=best_ask,
+            edge_vs_ask=edge_vs_ask,
+        )
+    if side == Side.DOWN and best_ask >= _MAX_DOWN_ENTRY_ASK:
+        return _skip(
+            state,
+            market,
+            orderbook,
+            lookup,
+            f"down_entry_ask_above_max:{best_ask}>={_MAX_DOWN_ENTRY_ASK}",
             settings.max_position_usd,
             side,
             token_id,

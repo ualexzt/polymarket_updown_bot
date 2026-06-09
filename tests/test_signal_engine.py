@@ -72,7 +72,7 @@ def _market():
     )
 
 
-def _orderbook(*, ask: Decimal = Decimal("0.65"), bid: Decimal = Decimal("0.62"), ask_size: Decimal = Decimal("1000"), liquidity: Decimal = Decimal("1000")):
+def _orderbook(*, ask: Decimal = Decimal("0.65"), bid: Decimal = Decimal("0.62"), down_ask: Decimal = Decimal("0.35"), down_bid: Decimal = Decimal("0.32"), ask_size: Decimal = Decimal("1000"), liquidity: Decimal = Decimal("1000")):
     from polymarket_round_bot.models import OrderbookSnapshot
 
     now = datetime.now(UTC)
@@ -88,9 +88,9 @@ def _orderbook(*, ask: Decimal = Decimal("0.65"), bid: Decimal = Decimal("0.62")
     )
     down = OrderbookSnapshot(
         token_id="down",
-        best_bid=Decimal("0.32"),
-        best_ask=Decimal("0.35"),
-        spread=Decimal("0.03"),
+        best_bid=down_bid,
+        best_ask=down_ask,
+        spread=down_ask - down_bid,
         bid_size=Decimal("100"),
         ask_size=Decimal("100"),
         liquidity_usd_estimate=Decimal("500"),
@@ -550,7 +550,7 @@ def test_trade_early_after_5m_down_entry():
         settings=s,
         state=_state(stage=Stage.AFTER_5M, pattern="strong_bull_close_near_high", seconds_to_expiry=571),
         market=_market(),
-        orderbook=_orderbook(),
+        orderbook=_orderbook(down_ask=Decimal("0.60"), down_bid=Decimal("0.57")),
         lookup=_lookup(prob=Decimal("0.85"), side=Side.DOWN),
         risk_allowed=True,
         risk_reject_reason=None,
@@ -560,6 +560,46 @@ def test_trade_early_after_5m_down_entry():
         binance_received_at_utc=datetime.now(UTC),
     )
     assert decision.decision == DecisionKind.TRADE
+
+
+def test_skip_down_entry_below_price_gate():
+    """DOWN entries below 0.55 are skipped; UP gates are unchanged."""
+    s = Settings()
+    decision = build_decision(
+        settings=s,
+        state=_state(stage=Stage.AFTER_5M, pattern="strong_bull_close_near_high", seconds_to_expiry=571),
+        market=_market(),
+        orderbook=_orderbook(down_ask=Decimal("0.54"), down_bid=Decimal("0.51")),
+        lookup=_lookup(prob=Decimal("0.85"), side=Side.DOWN),
+        risk_allowed=True,
+        risk_reject_reason=None,
+        open_positions_count=0,
+        daily_realized_pnl=Decimal("0"),
+        metadata_received_at_utc=datetime.now(UTC),
+        binance_received_at_utc=datetime.now(UTC),
+    )
+    assert decision.decision == DecisionKind.SKIP
+    assert decision.reason == "down_entry_ask_below_min:0.54<0.55"
+
+
+def test_skip_down_entry_at_max_price_gate():
+    """DOWN entries at 0.70 or above are skipped by the forward-test gate."""
+    s = Settings()
+    decision = build_decision(
+        settings=s,
+        state=_state(stage=Stage.AFTER_5M, pattern="strong_bull_close_near_high", seconds_to_expiry=571),
+        market=_market(),
+        orderbook=_orderbook(down_ask=Decimal("0.70"), down_bid=Decimal("0.67")),
+        lookup=_lookup(prob=Decimal("0.85"), side=Side.DOWN),
+        risk_allowed=True,
+        risk_reject_reason=None,
+        open_positions_count=0,
+        daily_realized_pnl=Decimal("0"),
+        metadata_received_at_utc=datetime.now(UTC),
+        binance_received_at_utc=datetime.now(UTC),
+    )
+    assert decision.decision == DecisionKind.SKIP
+    assert decision.reason == "down_entry_ask_above_max:0.70>=0.70"
 
 
 def test_skip_5m_when_disallowed():
