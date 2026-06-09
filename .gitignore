@@ -32,3 +32,6 @@ data/
 logs/
 *.log
 nohup.out
+
+# Local worktrees
+.worktrees/
