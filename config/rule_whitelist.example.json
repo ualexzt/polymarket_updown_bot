@@ -1,0 +1,13 @@
+{
+  "enabled": true,
+  "allowed_rules": {
+    "btc_15m_after_5m_above_open_d_005_010pct_vol_normal_bull_long_upper_wick": {
+      "side": "UP",
+      "max_entry_ask": "0.62",
+      "min_edge": "0.08"
+    }
+  },
+  "quarantined_rules": {
+    "btc_15m_after_5m_below_open_d_010_020pct_vol_normal_strong_bear_close_near_low": "negative live paper PnL in June 2026 baseline"
+  }
+}
