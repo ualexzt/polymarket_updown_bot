@@ -45,6 +45,11 @@ class Settings(BaseSettings):
     # WR > 90% to break even at entry 0.85+, which backtest showed
     # overfit. Forbid asks above this cap in v1.
     max_entry_ask: Decimal = Field(default=Decimal("0.80"))
+    # Optional side-specific gates. None means use the global value.
+    min_edge_up: Decimal | None = Field(default=None)
+    min_edge_down: Decimal | None = Field(default=None)
+    max_entry_ask_up: Decimal | None = Field(default=None)
+    max_entry_ask_down: Decimal | None = Field(default=None)
     max_spread: Decimal = Field(default=Decimal("0.03"))
     min_liquidity_usd: Decimal = Field(default=Decimal("25"))
     min_historical_probability: Decimal = Field(default=Decimal("0.60"))
@@ -102,6 +107,8 @@ class Settings(BaseSettings):
     state_rules_path: str = Field(
         default="config/btc_updown_state_rules_15m.json"
     )
+    rule_whitelist_path: str = Field(default="config/rule_whitelist.json")
+    rule_whitelist_enabled: bool = Field(default=False)
     database_path: str = Field(default="data/polymarket_round_paper.sqlite")
 
     # === Telegram reports ===
@@ -127,6 +134,10 @@ class Settings(BaseSettings):
     @property
     def state_rules_file(self) -> Path:
         return self.resolve("state_rules_path")
+
+    @property
+    def rule_whitelist_file(self) -> Path:
+        return self.resolve("rule_whitelist_path")
 
     @property
     def database_file(self) -> Path:

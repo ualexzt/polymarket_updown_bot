@@ -10,12 +10,14 @@ from polymarket_round_bot.models import (
     DecisionKind,
     DistanceBucket,
     PairOrderbook,
+    ProbabilityRule,
     RuleLookupResult,
     RuleMatchType,
     Side,
     Stage,
     VolatilityBucket,
 )
+from polymarket_round_bot.rule_whitelist import RuleGate, RuleWhitelist
 from polymarket_round_bot.signal_engine import build_decision
 
 
@@ -99,15 +101,196 @@ def _orderbook(*, ask: Decimal = Decimal("0.65"), bid: Decimal = Decimal("0.62")
     return PairOrderbook(up=up, down=down, received_at_utc=now)
 
 
-def _lookup(*, prob: Decimal = Decimal("0.85"), samples: int = 200, side: Side = Side.UP, no_trade: list[str] | None = None, return_aligned: bool = True, _match_type: RuleMatchType = RuleMatchType.EXACT):
+def _lookup(
+    *,
+    prob: Decimal = Decimal("0.85"),
+    samples: int = 200,
+    side: Side = Side.UP,
+    no_trade: list[str] | None = None,
+    return_aligned: bool = True,
+    _match_type: RuleMatchType = RuleMatchType.EXACT,
+    rule_id: str = "rule1",
+):
+    rule = ProbabilityRule(
+        rule_id=rule_id,
+        stage=Stage.AFTER_10M,
+        current_side=CurrentSide.ABOVE_OPEN,
+        distance_bucket=DistanceBucket.D_010_020pct,
+        volatility_bucket=VolatilityBucket.VOL_LOW,
+        pattern="normal_bull -> strong_bull_close_near_high",
+        recommended_side=side,
+        historical_probability=prob,
+        samples=samples,
+        median_round_return=Decimal("0.001"),
+        return_aligned=return_aligned,
+        usable_signal=True,
+    )
     return RuleLookupResult(
-        rule=None,
+        rule=rule,
         match_type=_match_type,
         historical_probability=prob,
         recommended_side=side,
         samples=samples,
         no_trade_reasons=no_trade or [],
     )
+
+
+def test_skip_when_whitelist_enabled_and_rule_not_allowed():
+    s = Settings()
+    whitelist = RuleWhitelist(enabled=True, allowed_rules={}, quarantined_rules={})
+    now = datetime(2024, 1, 1, 12, 0, 0, tzinfo=UTC)
+
+    decision = build_decision(
+        settings=s,
+        state=_state(),
+        market=_market(),
+        orderbook=_orderbook(ask=Decimal("0.65"), bid=Decimal("0.62")),
+        lookup=_lookup(prob=Decimal("0.85"), rule_id="rule_missing"),
+        risk_allowed=True,
+        risk_reject_reason=None,
+        open_positions_count=0,
+        daily_realized_pnl=Decimal("0"),
+        metadata_received_at_utc=now,
+        binance_received_at_utc=now,
+        now_utc=now,
+        rule_policy=whitelist,
+    )
+
+    assert decision.decision == DecisionKind.SKIP
+    assert decision.reason == "rule_not_whitelisted"
+
+
+def test_skip_when_rule_is_quarantined():
+    s = Settings()
+    whitelist = RuleWhitelist(
+        enabled=False,
+        allowed_rules={},
+        quarantined_rules={"rule1": "bad live pnl"},
+    )
+    now = datetime(2024, 1, 1, 12, 0, 0, tzinfo=UTC)
+
+    decision = build_decision(
+        settings=s,
+        state=_state(),
+        market=_market(),
+        orderbook=_orderbook(ask=Decimal("0.65"), bid=Decimal("0.62")),
+        lookup=_lookup(rule_id="rule1", prob=Decimal("0.85")),
+        risk_allowed=True,
+        risk_reject_reason=None,
+        open_positions_count=0,
+        daily_realized_pnl=Decimal("0"),
+        metadata_received_at_utc=now,
+        binance_received_at_utc=now,
+        now_utc=now,
+        rule_policy=whitelist,
+    )
+
+    assert decision.decision == DecisionKind.SKIP
+    assert decision.reason == "rule_quarantined:bad live pnl"
+
+
+def test_side_specific_min_edge_blocks_trade():
+    s = Settings(min_edge_up=Decimal("0.25"))
+    now = datetime(2024, 1, 1, 12, 0, 0, tzinfo=UTC)
+
+    decision = build_decision(
+        settings=s,
+        state=_state(),
+        market=_market(),
+        orderbook=_orderbook(ask=Decimal("0.65"), bid=Decimal("0.62")),
+        lookup=_lookup(prob=Decimal("0.85"), side=Side.UP),
+        risk_allowed=True,
+        risk_reject_reason=None,
+        open_positions_count=0,
+        daily_realized_pnl=Decimal("0"),
+        metadata_received_at_utc=now,
+        binance_received_at_utc=now,
+        now_utc=now,
+    )
+
+    assert decision.decision == DecisionKind.SKIP
+    assert decision.reason == "edge_below_min:0.20<0.25"
+
+
+def test_side_specific_max_entry_ask_blocks_trade():
+    s = Settings(max_entry_ask_up=Decimal("0.60"))
+    now = datetime(2024, 1, 1, 12, 0, 0, tzinfo=UTC)
+
+    decision = build_decision(
+        settings=s,
+        state=_state(),
+        market=_market(),
+        orderbook=_orderbook(ask=Decimal("0.65"), bid=Decimal("0.62")),
+        lookup=_lookup(prob=Decimal("0.85"), side=Side.UP),
+        risk_allowed=True,
+        risk_reject_reason=None,
+        open_positions_count=0,
+        daily_realized_pnl=Decimal("0"),
+        metadata_received_at_utc=now,
+        binance_received_at_utc=now,
+        now_utc=now,
+    )
+
+    assert decision.decision == DecisionKind.SKIP
+    assert decision.reason == "ask_above_max_entry_ask:0.65>0.60"
+
+
+def test_rule_specific_min_edge_blocks_trade():
+    s = Settings()
+    whitelist = RuleWhitelist(
+        enabled=True,
+        allowed_rules={"rule1": RuleGate(side=Side.UP, max_entry_ask=None, min_edge=Decimal("0.25"))},
+        quarantined_rules={},
+    )
+    now = datetime(2024, 1, 1, 12, 0, 0, tzinfo=UTC)
+
+    decision = build_decision(
+        settings=s,
+        state=_state(),
+        market=_market(),
+        orderbook=_orderbook(ask=Decimal("0.65"), bid=Decimal("0.62")),
+        lookup=_lookup(rule_id="rule1", prob=Decimal("0.85"), side=Side.UP),
+        risk_allowed=True,
+        risk_reject_reason=None,
+        open_positions_count=0,
+        daily_realized_pnl=Decimal("0"),
+        metadata_received_at_utc=now,
+        binance_received_at_utc=now,
+        now_utc=now,
+        rule_policy=whitelist,
+    )
+
+    assert decision.decision == DecisionKind.SKIP
+    assert decision.reason == "edge_below_min:0.20<0.25"
+
+
+def test_rule_specific_max_entry_ask_blocks_trade():
+    s = Settings()
+    whitelist = RuleWhitelist(
+        enabled=True,
+        allowed_rules={"rule1": RuleGate(side=Side.UP, max_entry_ask=Decimal("0.60"), min_edge=None)},
+        quarantined_rules={},
+    )
+    now = datetime(2024, 1, 1, 12, 0, 0, tzinfo=UTC)
+
+    decision = build_decision(
+        settings=s,
+        state=_state(),
+        market=_market(),
+        orderbook=_orderbook(ask=Decimal("0.65"), bid=Decimal("0.62")),
+        lookup=_lookup(rule_id="rule1", prob=Decimal("0.85"), side=Side.UP),
+        risk_allowed=True,
+        risk_reject_reason=None,
+        open_positions_count=0,
+        daily_realized_pnl=Decimal("0"),
+        metadata_received_at_utc=now,
+        binance_received_at_utc=now,
+        now_utc=now,
+        rule_policy=whitelist,
+    )
+
+    assert decision.decision == DecisionKind.SKIP
+    assert decision.reason == "ask_above_max_entry_ask:0.65>0.60"
 
 
 def test_trade_when_ask_leq_max_buy_price():

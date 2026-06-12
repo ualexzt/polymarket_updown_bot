@@ -47,6 +47,7 @@ from .models import (
     Stage,
     Timeframe,
 )
+from .rule_whitelist import RuleWhitelist
 
 _MIN_DOWN_SECONDS_TO_EXPIRY_AFTER_5M = 540
 _MIN_DOWN_ENTRY_ASK = Decimal("0.55")
@@ -74,6 +75,34 @@ def _is_truthy(value: bool) -> bool:
     return bool(value)
 
 
+def _side_min_edge(settings: Settings, side: Side) -> Decimal:
+    if side == Side.UP and settings.min_edge_up is not None:
+        return settings.min_edge_up
+    if side == Side.DOWN and settings.min_edge_down is not None:
+        return settings.min_edge_down
+    return settings.min_edge
+
+
+def _side_max_entry_ask(settings: Settings, side: Side) -> Decimal:
+    if side == Side.UP and settings.max_entry_ask_up is not None:
+        return settings.max_entry_ask_up
+    if side == Side.DOWN and settings.max_entry_ask_down is not None:
+        return settings.max_entry_ask_down
+    return settings.max_entry_ask
+
+
+def _strictest_decimal(base: Decimal, override: Decimal | None) -> Decimal:
+    if override is None:
+        return base
+    return max(base, override)
+
+
+def _strictest_entry_cap(base: Decimal, override: Decimal | None) -> Decimal:
+    if override is None:
+        return base
+    return min(base, override)
+
+
 def build_decision(
     *,
     settings: Settings,
@@ -88,6 +117,7 @@ def build_decision(
     metadata_received_at_utc: datetime,
     binance_received_at_utc: datetime,
     now_utc: datetime | None = None,
+    rule_policy: RuleWhitelist | None = None,
 ) -> SignalDecision:
     """Pure function: produce a TRADE or SKIP decision from inputs."""
     now = now_utc or datetime.now(UTC)
@@ -208,6 +238,32 @@ def build_decision(
     if side is None:
         return _skip(state, market, orderbook, lookup, "no_recommended_side", settings.max_position_usd)
 
+    rule_id = lookup.rule.rule_id if lookup.rule else None
+    if rule_policy is not None:
+        quarantine_reason = rule_policy.quarantine_reason(rule_id)
+        if quarantine_reason is not None:
+            return _skip(
+                state,
+                market,
+                orderbook,
+                lookup,
+                f"rule_quarantined:{quarantine_reason}",
+                settings.max_position_usd,
+                side,
+                None,
+            )
+        if not rule_policy.is_allowed(rule_id, side):
+            return _skip(
+                state,
+                market,
+                orderbook,
+                lookup,
+                "rule_not_whitelisted",
+                settings.max_position_usd,
+                side,
+                None,
+            )
+
     if (
         state.timeframe == Timeframe.M15
         and state.stage == Stage.AFTER_5M
@@ -245,6 +301,13 @@ def build_decision(
     safety_buffer = settings.safety_buffer
     max_buy_price = fair_price - safety_buffer
     edge_vs_ask = fair_price - best_ask  # positive = good for us
+    min_edge_required = _side_min_edge(settings, side)
+    max_entry_ask = _side_max_entry_ask(settings, side)
+    if rule_policy is not None:
+        gate = rule_policy.gate_for(lookup.rule.rule_id if lookup.rule else None)
+        if gate is not None:
+            min_edge_required = _strictest_decimal(min_edge_required, gate.min_edge)
+            max_entry_ask = _strictest_entry_cap(max_entry_ask, gate.max_entry_ask)
 
     if best_ask > max_buy_price:
         return _skip(
@@ -261,7 +324,7 @@ def build_decision(
             market_ask=best_ask,
             edge_vs_ask=edge_vs_ask,
         )
-    if best_ask > settings.max_entry_ask:
+    if best_ask > max_entry_ask:
         # Absolute cap independent of fair_price. Protects against
         # overfit rules where hist_prob is high but the implied WR
         # needed to break even at the ask is not actually met live.
@@ -270,7 +333,7 @@ def build_decision(
             market,
             orderbook,
             lookup,
-            f"ask_above_max_entry_ask:{best_ask}>{settings.max_entry_ask}",
+            f"ask_above_max_entry_ask:{best_ask}>{max_entry_ask}",
             settings.max_position_usd,
             side,
             token_id,
@@ -309,13 +372,13 @@ def build_decision(
             market_ask=best_ask,
             edge_vs_ask=edge_vs_ask,
         )
-    if edge_vs_ask < settings.min_edge:
+    if edge_vs_ask < min_edge_required:
         return _skip(
             state,
             market,
             orderbook,
             lookup,
-            f"edge_below_min:{edge_vs_ask}<{settings.min_edge}",
+            f"edge_below_min:{edge_vs_ask}<{min_edge_required}",
             settings.max_position_usd,
             side,
             token_id,
