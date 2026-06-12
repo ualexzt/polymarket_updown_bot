@@ -8,7 +8,7 @@ was never settled.
 from __future__ import annotations
 
 import sqlite3
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -128,7 +128,7 @@ def test_runner_passes_rule_policy_to_signal_engine_and_records_candle_age(tmp_p
         current_price=Decimal("100.1"),
         received_at_utc=now,
     )
-    orderbook_now = now
+    orderbook_now = now + timedelta(seconds=10)
     pair = PairOrderbook(
         up=OrderbookSnapshot(
             token_id="up",
@@ -213,6 +213,8 @@ def test_runner_passes_rule_policy_to_signal_engine_and_records_candle_age(tmp_p
 
     assert captured["rule_policy"] is policy
     assert snap.binance_data_age_seconds == Decimal("60.0")
+    assert snap.orderbook_age_seconds == Decimal("0")
+    assert snap.metadata_age_seconds == Decimal("0")
 
 
 # === current_expected_slug ===

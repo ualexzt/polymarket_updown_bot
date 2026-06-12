@@ -579,11 +579,11 @@ class Runner:
             market_accepting_orders=market.accepting_orders,
             orderbook_received_at_utc=orderbook.received_at_utc,
             orderbook_age_seconds=Decimal(
-                str((now - orderbook.received_at_utc).total_seconds())
+                str(max(0, (now - orderbook.received_at_utc).total_seconds()))
             ),
             metadata_received_at_utc=metadata_received_at_utc,
             metadata_age_seconds=Decimal(
-                str((now - metadata_received_at_utc).total_seconds())
+                str(max(0, (now - metadata_received_at_utc).total_seconds()))
             ),
             rule_id=lookup.rule.rule_id if lookup.rule else None,
             rule_match_type=lookup.match_type,
