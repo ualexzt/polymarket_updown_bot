@@ -75,6 +75,70 @@ def test_load_rule_whitelist_rejects_invalid_side(tmp_path):
         load_rule_whitelist(path)
 
 
+def test_load_rule_whitelist_rejects_non_finite_min_edge(tmp_path):
+    path = tmp_path / "nan-min-edge.json"
+    path.write_text(
+        json.dumps(
+            {
+                "enabled": True,
+                "allowed_rules": {"rule_a": {"min_edge": "NaN"}},
+                "quarantined_rules": {},
+            }
+        )
+    )
+
+    with pytest.raises(RuleWhitelistError, match="finite"):
+        load_rule_whitelist(path)
+
+
+def test_load_rule_whitelist_rejects_infinity_min_edge(tmp_path):
+    path = tmp_path / "inf-min-edge.json"
+    path.write_text(
+        json.dumps(
+            {
+                "enabled": True,
+                "allowed_rules": {"rule_a": {"min_edge": "Infinity"}},
+                "quarantined_rules": {},
+            }
+        )
+    )
+
+    with pytest.raises(RuleWhitelistError, match="finite"):
+        load_rule_whitelist(path)
+
+
+def test_load_rule_whitelist_rejects_negative_infinity_max_entry_ask(tmp_path):
+    path = tmp_path / "neginf-max-ask.json"
+    path.write_text(
+        json.dumps(
+            {
+                "enabled": True,
+                "allowed_rules": {"rule_a": {"max_entry_ask": "-Infinity"}},
+                "quarantined_rules": {},
+            }
+        )
+    )
+
+    with pytest.raises(RuleWhitelistError, match="finite"):
+        load_rule_whitelist(path)
+
+
+def test_load_rule_whitelist_rejects_overflow_to_infinity(tmp_path):
+    path = tmp_path / "overflow.json"
+    path.write_text(
+        json.dumps(
+            {
+                "enabled": True,
+                "allowed_rules": {"rule_a": {"min_edge": 1e1000}},
+                "quarantined_rules": {},
+            }
+        )
+    )
+
+    with pytest.raises(RuleWhitelistError, match="finite"):
+        load_rule_whitelist(path)
+
+
 def test_enabled_whitelist_blocks_unknown_rule():
     whitelist = RuleWhitelist(enabled=True, allowed_rules={}, quarantined_rules={})
 

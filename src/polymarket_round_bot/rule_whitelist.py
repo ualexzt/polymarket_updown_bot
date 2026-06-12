@@ -121,6 +121,11 @@ def _optional_decimal(value: object, rule_id: str, field: str) -> Decimal | None
     if value is None:
         return None
     try:
-        return Decimal(str(value))
+        d = Decimal(str(value))
     except Exception as e:
         raise RuleWhitelistError(f"allowed_rules.{rule_id}.{field} must be decimal-compatible") from e
+    if not d.is_finite():
+        raise RuleWhitelistError(
+            f"allowed_rules.{rule_id}.{field} must be a finite decimal, got {d}"
+        )
+    return d

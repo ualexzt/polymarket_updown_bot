@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sqlite3
 from decimal import Decimal
 
 from scripts.evaluate_rule_performance import fetch_rows, summarize_rows
@@ -7,6 +8,18 @@ from scripts.evaluate_rule_performance import fetch_rows, summarize_rows
 
 def test_fetch_rows_returns_empty_when_database_missing(tmp_path):
     assert fetch_rows(tmp_path / "missing" / "paper.sqlite", since=None) == []
+
+
+def test_fetch_rows_returns_empty_when_table_missing(tmp_path):
+    db = tmp_path / "fresh.sqlite"
+    sqlite3.connect(db).close()
+    assert fetch_rows(db, since=None) == []
+
+
+def test_fetch_rows_returns_empty_when_db_corrupted(tmp_path):
+    db = tmp_path / "bad.sqlite"
+    db.write_bytes(b"not a database")
+    assert fetch_rows(db, since=None) == []
 
 
 def test_summarize_rows_computes_rule_metrics():

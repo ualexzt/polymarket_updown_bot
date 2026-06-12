@@ -66,28 +66,38 @@ def summarize_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
 def fetch_rows(database: Path, since: str | None) -> list[dict[str, Any]]:
     if not database.exists():
         return []
-    con = sqlite3.connect(database)
-    con.row_factory = sqlite3.Row
-    where = "WHERE s.rule_id IS NOT NULL"
-    params: list[object] = []
-    if since:
-        where += " AND s.resolved_at_utc >= ?"
-        params.append(since)
-    sql = f"""
-        SELECT
-            s.rule_id,
-            s.selected_side,
-            p.stage_at_entry AS stage,
-            s.entry_price,
-            s.historical_probability_at_entry,
-            s.edge_at_entry,
-            s.won,
-            s.realized_pnl_usd
-        FROM settlements s
-        JOIN paper_positions p ON p.position_id = s.position_id
-        {where}
-    """
-    return [dict(r) for r in con.execute(sql, params).fetchall()]
+    try:
+        con = sqlite3.connect(database)
+    except sqlite3.DatabaseError as e:
+        print(f"warning: could not open {database}: {e}", file=sys.stderr)
+        return []
+    try:
+        con.row_factory = sqlite3.Row
+        where = "WHERE s.rule_id IS NOT NULL"
+        params: list[object] = []
+        if since:
+            where += " AND s.resolved_at_utc >= ?"
+            params.append(since)
+        sql = f"""
+            SELECT
+                s.rule_id,
+                s.selected_side,
+                p.stage_at_entry AS stage,
+                s.entry_price,
+                s.historical_probability_at_entry,
+                s.edge_at_entry,
+                s.won,
+                s.realized_pnl_usd
+            FROM settlements s
+            JOIN paper_positions p ON p.position_id = s.position_id
+            {where}
+        """
+        return [dict(r) for r in con.execute(sql, params).fetchall()]
+    except (sqlite3.OperationalError, sqlite3.DatabaseError) as e:
+        print(f"warning: query failed against {database}: {e}", file=sys.stderr)
+        return []
+    finally:
+        con.close()
 
 
 def _json_default(value: object) -> str:
