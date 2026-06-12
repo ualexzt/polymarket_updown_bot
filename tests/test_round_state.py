@@ -1,7 +1,7 @@
 """Tests for round state computation."""
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
 from polymarket_round_bot.models import (
@@ -12,7 +12,11 @@ from polymarket_round_bot.models import (
     Stage,
     VolatilityBucket,
 )
-from polymarket_round_bot.round_state import build_round_state
+from polymarket_round_bot.round_state import (
+    _classify_distance,
+    _classify_volatility,
+    build_round_state,
+)
 
 
 def _mk_candle(open_time_utc, o, h, lo, c):
@@ -64,6 +68,21 @@ def test_below_open_when_current_below():
     assert state.current_side == CurrentSide.BELOW_OPEN
 
 
+def test_distance_bucket_boundaries_match_research_right_closed_bins():
+    """Research used pandas.cut right-closed bins; exact boundaries stay in lower bucket."""
+    cases = [
+        (Decimal("0.0005"), DistanceBucket.D_0_005pct),
+        (Decimal("0.0010"), DistanceBucket.D_005_010pct),
+        (Decimal("0.0020"), DistanceBucket.D_010_020pct),
+        (Decimal("0.0035"), DistanceBucket.D_020_035pct),
+        (Decimal("0.0050"), DistanceBucket.D_035_050pct),
+        (Decimal("0.0050001"), DistanceBucket.D_GT_050pct),
+    ]
+    for distance, expected in cases:
+        assert _classify_distance(distance) == expected
+        assert _classify_distance(-distance) == expected
+
+
 def test_distance_bucket_assignment():
     """Each test case explicitly sets round_open=100, current=price."""
     market_start = datetime(2024, 1, 1, 12, 0, 0, tzinfo=UTC)
@@ -89,6 +108,12 @@ def test_distance_bucket_assignment():
         )
 
 
+def test_volatility_bucket_boundaries_are_research_inclusive():
+    assert _classify_volatility(Decimal("0.000897")) == VolatilityBucket.VOL_LOW
+    assert _classify_volatility(Decimal("0.001871")) == VolatilityBucket.VOL_NORMAL
+    assert _classify_volatility(Decimal("0.001872")) == VolatilityBucket.VOL_HIGH
+
+
 def test_volatility_bucket_insufficient_data_returns_unknown():
     market_start = datetime(2024, 1, 1, 12, 0, 0, tzinfo=UTC)
     market = _market_5m(market_start)
@@ -101,6 +126,76 @@ def test_volatility_bucket_insufficient_data_returns_unknown():
     )
     state = build_round_state(binance, market, now_utc=market_start.replace())
     assert state.volatility_bucket == VolatilityBucket.VOL_UNKNOWN
+
+
+def test_15m_near_open_maps_to_reference_binary_side():
+    """Research had no AT_OPEN side; exact/near ties should not create untradeable 15m tuples."""
+    market_start = datetime(2024, 1, 1, 12, 0, 0, tzinfo=UTC)
+    market = _market_15m(market_start)
+    candles = [
+        _mk_candle(market_start, "100", "100.01", "99.99", "100.002"),
+    ]
+    binance = BinanceState(
+        symbol="BTCUSDT",
+        candles=candles,
+        current_price=Decimal("100.002"),
+        received_at_utc=market_start + timedelta(minutes=6),
+    )
+
+    state = build_round_state(binance, market, now_utc=market_start + timedelta(minutes=6))
+
+    assert state.timeframe.value == "15m"
+    assert state.current_side == CurrentSide.ABOVE_OPEN
+
+    exact_tie = build_round_state(
+        BinanceState(
+            symbol="BTCUSDT",
+            candles=[_mk_candle(market_start, "100", "100.01", "99.99", "100")],
+            current_price=Decimal("100"),
+            received_at_utc=market_start + timedelta(minutes=6),
+        ),
+        market,
+        now_utc=market_start + timedelta(minutes=6),
+    )
+    assert exact_tie.current_side == CurrentSide.BELOW_OPEN
+
+
+def test_volatility_uses_previous_completed_15m_round_returns():
+    """Volatility must match research: mean of previous completed 15m round abs returns."""
+    market_start = datetime(2024, 1, 1, 16, 0, 0, tzinfo=UTC)
+    market = _market_15m(market_start)
+    candles = []
+
+    # 16 completed 15m rounds before market_start. Each round has c0/c1/c2.
+    # Round return = abs(c2.close / c0.open - 1). Use 0.10% each -> VOL_NORMAL
+    # with thresholds LOW <= 0.000897, NORMAL <= 0.001871.
+    first_round = market_start - timedelta(hours=4)
+    for round_index in range(16):
+        start = first_round + timedelta(minutes=15 * round_index)
+        base = Decimal("100")
+        close = Decimal("100.10")
+        candles.extend(
+            [
+                _mk_candle(start, base, "100.05", "99.95", "100.02"),
+                _mk_candle(start + timedelta(minutes=5), "100.02", "100.08", "99.98", "100.06"),
+                _mk_candle(start + timedelta(minutes=10), "100.06", "100.12", "100.00", close),
+            ]
+        )
+
+    # Current in-round c0 so build_round_state can produce AFTER_5M.
+    candles.append(_mk_candle(market_start, "100", "100.2", "99.9", "100.1"))
+
+    binance = BinanceState(
+        symbol="BTCUSDT",
+        candles=candles,
+        current_price=Decimal("100.1"),
+        received_at_utc=market_start + timedelta(minutes=6),
+    )
+
+    state = build_round_state(binance, market, now_utc=market_start + timedelta(minutes=6))
+
+    assert state.prev_16_abs_return_mean == Decimal("0.001")
+    assert state.volatility_bucket == VolatilityBucket.VOL_NORMAL
 
 
 def test_15m_after_5m_state():

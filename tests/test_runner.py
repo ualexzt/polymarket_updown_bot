@@ -27,6 +27,7 @@ from polymarket_round_bot.polymarket_discovery import DiscoveryError
 from polymarket_round_bot.probability_rules import ProbabilityRules
 from polymarket_round_bot.risk_manager import RiskManager
 from polymarket_round_bot.runner import (
+    BINANCE_KLINE_LIMIT,
     Runner,
     current_expected_slug,
     slug_window,
@@ -62,6 +63,17 @@ def _broker() -> PaperBroker:
 
 def _risk(settings: Settings) -> RiskManager:
     return RiskManager(settings)
+
+
+# === Binance fetch depth ===
+
+
+def test_binance_kline_limit_covers_previous_16_completed_15m_rounds():
+    """Runner must fetch enough 5m candles for research-compatible volatility."""
+    prior_15m_round_candles = 16 * 3
+    current_round_candle = 1
+
+    assert prior_15m_round_candles + current_round_candle <= BINANCE_KLINE_LIMIT
 
 
 # === current_expected_slug ===

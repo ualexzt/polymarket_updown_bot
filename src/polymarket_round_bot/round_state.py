@@ -15,7 +15,7 @@ in the list — we don't need to "promote" anything.
 """
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Final
 
@@ -53,6 +53,7 @@ _DISTANCE_BUCKETS: Final[tuple[tuple[Decimal, DistanceBucket], ...]] = (
 
 _NO_INTERNAL_CANDLES_PATTERN: Final[str] = "no_internal_candles"
 _FIVE_MIN_SECONDS: Final[int] = 5 * 60
+_FIFTEEN_MIN_SECONDS: Final[int] = 15 * 60
 
 
 def _safe_div(num: Decimal, den: Decimal) -> Decimal:
@@ -71,9 +72,10 @@ def _signed_distance_pct(current: Decimal, base: Decimal) -> Decimal:
 
 
 def _classify_distance(distance_pct: Decimal) -> DistanceBucket:
+    """Classify absolute distance using research-compatible right-closed bins."""
     abs_d = abs(distance_pct)
     for upper, bucket in _DISTANCE_BUCKETS:
-        if abs_d < upper:
+        if abs_d <= upper:
             return bucket
     return DistanceBucket.D_GT_050pct
 
@@ -84,12 +86,21 @@ def _classify_current_side(distance_pct: Decimal) -> CurrentSide:
     return CurrentSide.ABOVE_OPEN if distance_pct > 0 else CurrentSide.BELOW_OPEN
 
 
+def _classify_current_side_for_market(
+    distance_pct: Decimal, market: MarketMetadata
+) -> CurrentSide:
+    """Use reference-compatible binary side for calibrated 15m rules."""
+    if not _is_15m_market(market):
+        return _classify_current_side(distance_pct)
+    return CurrentSide.ABOVE_OPEN if distance_pct > Decimal("0") else CurrentSide.BELOW_OPEN
+
+
 def _classify_volatility(prev_mean: Decimal | None) -> VolatilityBucket:
     if prev_mean is None:
         return VolatilityBucket.VOL_UNKNOWN
-    if prev_mean < _VOL_LOW_MAX:
+    if prev_mean <= _VOL_LOW_MAX:
         return VolatilityBucket.VOL_LOW
-    if prev_mean < _VOL_NORMAL_MAX:
+    if prev_mean <= _VOL_NORMAL_MAX:
         return VolatilityBucket.VOL_NORMAL
     return VolatilityBucket.VOL_HIGH
 
@@ -97,20 +108,33 @@ def _classify_volatility(prev_mean: Decimal | None) -> VolatilityBucket:
 def _compute_prev_volatility_mean(
     candles: list[Candle], *, round_start_ts: datetime
 ) -> Decimal | None:
-    """Mean of |close-to-close returns| over the last 16 candles that
-    ended STRICTLY before the current round's start (no leakage)."""
-    prior = [c for c in candles if c.is_closed and c.open_time_utc < round_start_ts]
-    prior.sort(key=lambda c: c.open_time_utc)
-    prior = prior[-_VOL_WINDOW:]
-    if len(prior) < 2:
+    """Mean abs return of previous 16 completed 15m rounds.
+
+    Matches research: round_abs_return = abs(c2.close / c0.open - 1),
+    using only closed candles strictly before the current round start.
+    """
+    closed = [c for c in candles if c.is_closed and c.open_time_utc < round_start_ts]
+    closed.sort(key=lambda c: c.open_time_utc)
+    by_open = {c.open_time_utc: c for c in closed}
+
+    returns: list[Decimal] = []
+    for c0 in closed:
+        diff_seconds = int((round_start_ts - c0.open_time_utc).total_seconds())
+        if diff_seconds <= 0 or diff_seconds % (15 * 60) != 0:
+            continue
+        c1 = by_open.get(c0.open_time_utc + timedelta(minutes=5))
+        c2 = by_open.get(c0.open_time_utc + timedelta(minutes=10))
+        round_end = c0.open_time_utc + timedelta(minutes=15)
+        if c1 is None or c2 is None or round_end > round_start_ts:
+            continue
+        if c0.open == Decimal("0"):
+            continue
+        returns.append(abs(_safe_div(c2.close - c0.open, c0.open)))
+
+    returns = returns[-_VOL_WINDOW:]
+    if len(returns) < _VOL_WINDOW:
         return None
-    rets = [
-        abs(_safe_div(prior[i].close - prior[i - 1].close, prior[i - 1].close))
-        for i in range(1, len(prior))
-    ]
-    if not rets:
-        return None
-    return sum(rets, Decimal("0")) / Decimal(len(rets))
+    return sum(returns, Decimal("0")) / Decimal(len(returns))
 
 
 def _candles_in_round(candles: list[Candle], market: MarketMetadata) -> list[Candle]:
@@ -125,6 +149,11 @@ def _candles_in_round(candles: list[Candle], market: MarketMetadata) -> list[Can
 def _is_5m_market(market: MarketMetadata) -> bool:
     duration = (market.end_ts - market.start_ts).total_seconds()
     return duration <= _FIVE_MIN_SECONDS + 1
+
+
+def _is_15m_market(market: MarketMetadata) -> bool:
+    duration = (market.end_ts - market.start_ts).total_seconds()
+    return abs(duration - _FIFTEEN_MIN_SECONDS) <= 1
 
 
 def _round_open_price(market: MarketMetadata, binance: BinanceState) -> Decimal:
@@ -157,7 +186,7 @@ def build_round_state(
     round_open = _round_open_price(market, binance)
     current = binance.current_price
     distance_pct = _signed_distance_pct(current, round_open)
-    current_side = _classify_current_side(distance_pct)
+    current_side = _classify_current_side_for_market(distance_pct, market)
     distance_bucket = _classify_distance(distance_pct)
     vol_mean = _compute_prev_volatility_mean(
         binance.candles, round_start_ts=market.start_ts

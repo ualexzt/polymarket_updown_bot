@@ -12,7 +12,7 @@ import time
 import uuid
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
-from typing import Any
+from typing import Any, Final
 
 from .binance_client import fetch_5m_close_at, fetch_recent_5m_klines
 from .config import Settings
@@ -38,6 +38,10 @@ from .telegram_reports import TelegramReportService
 from .url_parser import UrlParserError, parse_market_url
 
 log = logging.getLogger("polymarket_round_bot")
+
+# Need 16 completed 15m rounds (48 closed 5m candles) plus current in-round
+# candle(s) for research-compatible volatility and state construction.
+BINANCE_KLINE_LIMIT: Final[int] = 60
 
 
 class RunnerError(RuntimeError):
@@ -110,7 +114,7 @@ class Runner:
         # 2. Binance state
         binance = fetch_recent_5m_klines(
             self._settings.btc_symbol,
-            limit=20,  # covers ~100 min of history; plenty for round_open + vol window
+            limit=BINANCE_KLINE_LIMIT,
             timeout=self._settings.http_timeout_seconds,
             user_agent=self._settings.http_user_agent,
         )
