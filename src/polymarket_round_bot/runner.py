@@ -31,6 +31,7 @@ from .polymarket_discovery import discover_market
 from .probability_rules import ProbabilityRules
 from .risk_manager import RiskManager
 from .round_state import build_round_state
+from .rule_whitelist import RuleWhitelist
 from .settlement import mark_position_settled, settle_position
 from .signal_engine import build_decision
 from .storage import Storage
@@ -84,6 +85,7 @@ class Runner:
         risk: RiskManager,
         slug: str,
         timeframe: Timeframe | None = None,
+        rule_policy: RuleWhitelist | None = None,
     ) -> None:
         self._settings = settings
         self._storage = storage
@@ -95,6 +97,7 @@ class Runner:
         # current window on every cycle. None = explicit-URL mode
         # (slug stays fixed for the lifetime of the runner).
         self._timeframe = timeframe
+        self._rule_policy = rule_policy
         self._telegram_reports = TelegramReportService(settings, storage)
 
     # === One cycle ===
@@ -223,6 +226,7 @@ class Runner:
             metadata_received_at_utc=datetime.now(UTC),
             binance_received_at_utc=binance.received_at_utc,
             now_utc=now,
+            rule_policy=self._rule_policy,
         )
         log.info("decision=%s reason=%s", decision.decision.value, decision.reason)
 
@@ -509,11 +513,11 @@ class Runner:
 
         # Binanace data age: from latest closed candle
         last_candle = binance.candles[-1] if binance.candles else None
-        binance_age = (
-            Decimal(str((now - last_candle.open_time_utc).total_seconds() + 300))
-            if last_candle is not None
-            else Decimal("0")
-        )
+        if last_candle is not None:
+            candle_close_time = last_candle.open_time_utc + timedelta(minutes=5)
+            binance_age = Decimal(str(max(0, (now - candle_close_time).total_seconds())))
+        else:
+            binance_age = Decimal("0")
 
         return DecisionSnapshot(
             decision_id=f"dec_{uuid.uuid4().hex[:12]}",

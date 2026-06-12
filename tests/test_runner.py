@@ -10,6 +10,7 @@ from __future__ import annotations
 import sqlite3
 from datetime import UTC, datetime
 from decimal import Decimal
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -74,6 +75,144 @@ def test_binance_kline_limit_covers_previous_16_completed_15m_rounds():
     current_round_candle = 1
 
     assert prior_15m_round_candles + current_round_candle <= BINANCE_KLINE_LIMIT
+
+
+# === current_expected_slug ===
+
+
+def test_runner_passes_rule_policy_to_signal_engine_and_records_candle_age(tmp_path):
+    from polymarket_round_bot.models import (
+        BinanceState,
+        Candle,
+        DecisionKind,
+        MarketMetadata,
+        OrderbookSnapshot,
+        PairOrderbook,
+        RuleLookupResult,
+        RuleMatchType,
+        SignalDecision,
+    )
+    from polymarket_round_bot.rule_whitelist import RuleWhitelist
+
+    settings = _settings(tmp_path)
+    storage = _storage(tmp_path)
+    policy = RuleWhitelist(enabled=True, allowed_rules={}, quarantined_rules={})
+    captured = {}
+    now = datetime(2024, 1, 1, 12, 6, 0, tzinfo=UTC)
+    market = MarketMetadata(
+        market_id="m1",
+        condition_id="0xabc",
+        question="q",
+        slug="btc-updown-15m-1700000000",
+        up_token_id="up",
+        down_token_id="down",
+        outcomes=["Up", "Down"],
+        start_ts=datetime(2024, 1, 1, 12, 0, 0, tzinfo=UTC),
+        end_ts=datetime(2024, 1, 1, 12, 15, 0, tzinfo=UTC),
+        active=True,
+        closed=False,
+        accepting_orders=True,
+    )
+    candle = Candle(
+        open_time_utc=market.start_ts,
+        open=Decimal("100"),
+        high=Decimal("100.2"),
+        low=Decimal("99.9"),
+        close=Decimal("100.1"),
+        volume=Decimal("100"),
+        is_closed=True,
+    )
+    binance = BinanceState(
+        symbol="BTCUSDT",
+        candles=[candle],
+        current_price=Decimal("100.1"),
+        received_at_utc=now,
+    )
+    orderbook_now = now
+    pair = PairOrderbook(
+        up=OrderbookSnapshot(
+            token_id="up",
+            best_bid=Decimal("0.62"),
+            best_ask=Decimal("0.65"),
+            spread=Decimal("0.03"),
+            bid_size=Decimal("100"),
+            ask_size=Decimal("100"),
+            liquidity_usd_estimate=Decimal("1000"),
+            received_at_utc=orderbook_now,
+        ),
+        down=OrderbookSnapshot(
+            token_id="down",
+            best_bid=Decimal("0.32"),
+            best_ask=Decimal("0.35"),
+            spread=Decimal("0.03"),
+            bid_size=Decimal("100"),
+            ask_size=Decimal("100"),
+            liquidity_usd_estimate=Decimal("1000"),
+            received_at_utc=orderbook_now,
+        ),
+        received_at_utc=orderbook_now,
+    )
+    lookup = RuleLookupResult(
+        rule=None,
+        match_type=RuleMatchType.NO_MATCH,
+        historical_probability=None,
+        recommended_side=None,
+        samples=0,
+        no_trade_reasons=["no_rule_for_state"],
+    )
+
+    class FakeRules:
+        def lookup(self, **kwargs):
+            return lookup
+
+    def fake_build_decision(**kwargs):
+        captured["rule_policy"] = kwargs.get("rule_policy")
+        state = kwargs["state"]
+        return SignalDecision(
+            decision=DecisionKind.SKIP,
+            side=None,
+            market_slug=market.slug,
+            event_url="https://polymarket.com/event/test",
+            token_id=None,
+            stage=state.stage,
+            current_side=state.current_side,
+            distance_bucket=state.distance_bucket,
+            volatility_bucket=state.volatility_bucket,
+            pattern=state.candle_pattern,
+            rule_id=None,
+            rule_match_type=RuleMatchType.NO_MATCH,
+            samples=0,
+            historical_probability=None,
+            safety_buffer=Decimal("0"),
+            max_buy_price=None,
+            market_ask=None,
+            edge_vs_ask=None,
+            spread=None,
+            size_usd=Decimal("1"),
+            reason="test_skip",
+        )
+
+    runner = Runner(
+        settings=settings,
+        storage=storage,
+        rules=FakeRules(),  # type: ignore[arg-type]
+        broker=_broker(),
+        risk=_risk(settings),
+        slug=market.slug,
+        timeframe=Timeframe.M15,
+        rule_policy=policy,
+    )
+
+    with (
+        patch("polymarket_round_bot.runner.discover_market", return_value=(market, SimpleNamespace(alignment="MATCHES_START"))),
+        patch("polymarket_round_bot.runner.fetch_recent_5m_klines", return_value=binance),
+        patch("polymarket_round_bot.runner.fetch_pair_orderbook", return_value=pair),
+        patch("polymarket_round_bot.runner.build_decision", side_effect=fake_build_decision),
+    ):
+        snap = runner.run_one_cycle(now_utc=now)
+
+    assert captured["rule_policy"] is policy
+    assert snap.binance_data_age_seconds == Decimal("60.0")
 
 
 # === current_expected_slug ===

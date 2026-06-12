@@ -25,6 +25,11 @@ from polymarket_round_bot.models import Timeframe
 from polymarket_round_bot.paper_broker import PaperBroker
 from polymarket_round_bot.probability_rules import ProbabilityRules
 from polymarket_round_bot.risk_manager import RiskManager
+from polymarket_round_bot.rule_whitelist import (
+    EMPTY_RULE_WHITELIST,
+    RuleWhitelistError,
+    load_rule_whitelist,
+)
 from polymarket_round_bot.runner import Runner, current_expected_slug
 from polymarket_round_bot.storage import Storage
 from polymarket_round_bot.url_parser import parse_market_url
@@ -101,6 +106,18 @@ def main() -> int:
     except Exception as e:
         log.error("failed_to_load_rules path=%s err=%s", settings.state_rules_file, e)
         return 2
+    rule_policy = EMPTY_RULE_WHITELIST
+    if settings.rule_whitelist_enabled:
+        try:
+            rule_policy = load_rule_whitelist(settings.rule_whitelist_file)
+        except RuleWhitelistError as e:
+            log.error(
+                "failed_to_load_rule_whitelist path=%s err=%s",
+                settings.rule_whitelist_file,
+                e,
+            )
+            return 2
+
     broker = PaperBroker()
     risk = RiskManager(settings)
 
@@ -120,6 +137,7 @@ def main() -> int:
         risk=risk,
         slug=slug,
         timeframe=args.timeframe if not (args.event_url or args.slug) else None,
+        rule_policy=rule_policy,
     )
 
     try:
