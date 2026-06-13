@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import sys
 import uuid
 from pathlib import Path
@@ -61,6 +62,34 @@ def _setup_logging(verbose: bool) -> None:
     )
 
 
+def _build_telemetry_writer() -> object | None:
+    """Construct a control plane TelemetryWriter if configured.
+
+    Returns None when CONTROL_PLANE_DATABASE_URL is unset so the bot
+    keeps working in standalone mode. Failures to construct the
+    writer are logged and treated as "telemetry disabled" — never
+    break the bot for telemetry.
+    """
+    database_url = os.environ.get("CONTROL_PLANE_DATABASE_URL")
+    if not database_url:
+        return None
+    try:
+        from sqlalchemy import create_engine
+        from sqlalchemy.orm import sessionmaker
+
+        from polymarket_control_plane_sdk import TelemetryWriter
+
+        engine = create_engine(database_url)
+        Session = sessionmaker(bind=engine, autoflush=False, autocommit=False)
+        writer = TelemetryWriter(Session)
+        writer.ensure_schema()
+        log.info("control_plane_telemetry_enabled url=%s", database_url)
+        return writer
+    except Exception as exc:  # noqa: BLE001
+        log.warning("control_plane_telemetry_init_failed err=%s", exc)
+        return None
+
+
 def main() -> int:
     p = argparse.ArgumentParser(description="Polymarket BTC UP/DOWN state-pricing PAPER bot")
     p.add_argument("--mode", choices=["paper"], default="paper")
@@ -100,7 +129,11 @@ def main() -> int:
     slug = _resolve_slug(args, settings)
     log.info("resolved_slug=%s", slug)
 
-    storage = Storage(settings.database_file)
+    storage = Storage(
+        settings.database_file,
+        telemetry_writer=_build_telemetry_writer(),
+        strategy_id=os.environ.get("STRATEGY_ID", "polymarket-updown-paper"),
+    )
     try:
         rules = ProbabilityRules.from_file(settings.state_rules_file)
     except Exception as e:

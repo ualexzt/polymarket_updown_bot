@@ -208,10 +208,36 @@ def _dec(v: Decimal | None) -> str | None:
 
 
 class Storage:
-    def __init__(self, db_path: Path) -> None:
+    def __init__(
+        self,
+        db_path: Path,
+        *,
+        telemetry_writer: object | None = None,
+        strategy_id: str | None = None,
+    ) -> None:
         self.db_path = db_path
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        self._telemetry_writer = telemetry_writer
+        self._strategy_id = strategy_id
         self._init_schema()
+
+    def _emit(self, method_name: str, **kwargs: object) -> None:
+        """Mirror a write to the control plane telemetry writer if configured.
+
+        Failures are logged and swallowed: telemetry is best-effort and
+        must never break the bot's local persistence path.
+        """
+        if self._telemetry_writer is None or self._strategy_id is None:
+            return
+        method = getattr(self._telemetry_writer, method_name, None)
+        if method is None:
+            return
+        try:
+            method(**kwargs)
+        except Exception as exc:  # noqa: BLE001
+            log.warning(
+                "telemetry_emit_failed method=%s err=%s", method_name, exc
+            )
 
     @contextmanager
     def _conn(self) -> Iterator[sqlite3.Connection]:
@@ -257,6 +283,18 @@ class Storage:
                 "INSERT INTO bot_runs(run_id, started_at_utc, bot_mode, settings_json) VALUES(?,?,?,?)",
                 (run_id, _now_iso(), bot_mode, settings_json),
             )
+        if self._strategy_id is not None:
+            self._emit(
+                "write_strategy_identity",
+                strategy_id=self._strategy_id,
+                name=f"Polymarket Up/Down Bot ({bot_mode})",
+                kind="updown-15m",
+                mode=bot_mode,
+                asset="BTC",
+                status="running",
+                config_version=f"run:{run_id}",
+                last_seen_at=datetime.now(UTC),
+            )
 
     def end_run(self, run_id: str, *, notes: str | None = None) -> None:
         with self._conn() as conn:
@@ -295,6 +333,24 @@ class Storage:
                 """,
                 _decision_row(snap),
             )
+        if self._strategy_id is not None:
+            self._emit(
+                "write_snapshot",
+                strategy_id=self._strategy_id,
+                captured_at=snap.timestamp_utc,
+                operational_status="healthy" if snap.risk_allowed else "degraded",
+                risk_severity=("high" if not snap.risk_allowed else "low"),
+                activity_state=("active" if snap.decision.value == "TRADE" else "pending"),
+                freshness="live",
+                current_market=snap.market_slug,
+                open_positions=snap.open_positions_count,
+                pnl_amount=_dec(snap.daily_realized_pnl),
+                open_exposure_amount=(
+                    _dec(snap.requested_size_usd) if snap.decision.value == "TRADE" else Decimal("0")
+                ),
+                current_market_count=1,
+                raw_payload=_decision_row(snap),
+            )
 
     # === Positions ===
 
@@ -315,6 +371,21 @@ class Storage:
                 )
                 """,
                 _position_row(pos),
+            )
+        if self._strategy_id is not None:
+            self._emit(
+                "write_position",
+                external_position_id=pos.position_id,
+                strategy_id=self._strategy_id,
+                market_slug=pos.market_slug,
+                side=pos.selected_side.value,
+                status=pos.status.value,
+                size=pos.shares,
+                average_price=_dec(pos.entry_price),
+                opened_at=pos.entry_timestamp_utc,
+                closed_at=None,
+                updated_at=datetime.now(UTC),
+                raw_payload=_position_row(pos),
             )
 
     def get_position(self, position_id: str) -> PaperPosition | None:
@@ -479,6 +550,22 @@ class Storage:
                 )
                 """,
                 _settlement_row(s),
+            )
+        if self._strategy_id is not None:
+            self._emit(
+                "write_settlement",
+                external_settlement_id=s.settlement_id,
+                strategy_id=self._strategy_id,
+                market_slug=s.market_slug,
+                side=s.selected_side.value,
+                winner=s.resolved_outcome.value,
+                entry_price=_dec(s.entry_price),
+                size=s.shares,
+                realized_pnl=_dec(s.realized_pnl_usd),
+                result=("win" if s.won else "loss"),
+                settled_at=s.resolved_at_utc,
+                source=s.settlement_source.value,
+                raw_payload=_settlement_row(s),
             )
 
     def list_settlements(self, since_iso: str | None = None) -> list[Settlement]:
