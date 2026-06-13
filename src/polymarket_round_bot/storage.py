@@ -335,7 +335,7 @@ class Storage:
             )
         if self._strategy_id is not None:
             self._emit(
-                "write_snapshot",
+                "write_snapshot_if_changed",
                 strategy_id=self._strategy_id,
                 captured_at=snap.timestamp_utc,
                 operational_status="healthy" if snap.risk_allowed else "degraded",
@@ -349,7 +349,6 @@ class Storage:
                     _dec(snap.requested_size_usd) if snap.decision.value == "TRADE" else Decimal("0")
                 ),
                 current_market_count=1,
-                raw_payload=_decision_row(snap),
             )
 
     # === Positions ===
