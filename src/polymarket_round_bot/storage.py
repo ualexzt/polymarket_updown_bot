@@ -386,6 +386,28 @@ class Storage:
                 updated_at=datetime.now(UTC),
                 raw_payload=_position_row(pos),
             )
+            # Mirror the paper order itself so the control plane
+            # /api/orders table can show it. Paper-broker logic
+            # collapses order → position (one decision = one
+            # paper_position = one paper_order), so the natural key
+            # is the decision_id. This emit is best-effort and
+            # never affects trading: it is gated on the same
+            # telemetry_writer + strategy_id check as positions and
+            # failures are swallowed by _emit().
+            self._emit(
+                "write_order",
+                external_order_id=pos.decision_id,
+                strategy_id=self._strategy_id,
+                market_slug=pos.market_slug,
+                side=pos.selected_side.value,
+                status=pos.status.value,
+                price=pos.entry_price,
+                size=pos.shares,
+                created_at=pos.entry_timestamp_utc,
+                source_created_at=pos.entry_timestamp_utc,
+                updated_at=datetime.now(UTC),
+                raw_payload=_position_row(pos),
+            )
 
     def get_position(self, position_id: str) -> PaperPosition | None:
         with self._conn() as conn:
