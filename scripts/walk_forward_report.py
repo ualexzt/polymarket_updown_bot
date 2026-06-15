@@ -71,20 +71,28 @@ def regime_table_markdown(rows: list[dict[str, Any]], key_header: str = "Bucket"
         "|---|---|---|---|",
     ]
     for r in rows:
+        # Use 'key' if present, else 'entry_price_bin' (for breakeven table) or 'rule_id' (for rule rankings)
+        key = r.get("key") or r.get("entry_price_bin") or r.get("rule_id", "?")
+        n = r.get("n") or r.get("n_trades", 0)
+        wr = r.get("wr", "0")
+        pnl = r.get("pnl", "0")
         lines.append(
-            f"| {r['key']} | {r['n']} | {_fmt_wr(r['wr'])} | {_fmt_pnl(r['pnl'])} |"
+            f"| {key} | {n} | {_fmt_wr(wr)} | {_fmt_pnl(pnl)} |"
         )
     return "\n".join(lines)
 
 
 # === Main renderer ===
 
-def render_report(*, aggregate: dict[str, Any], out_path: Path) -> None:
+def render_report(*, aggregate: dict[str, Any], out_path: Path, in_dir: Path | None = None) -> None:
     """Compose the markdown report from aggregate summary + per-trade CSVs (if present)."""
     folds = aggregate["folds"]
     cross = aggregate["cross_fold"]
     n_total_trades = sum(f["n_trades"] for f in folds)
     pnl_total = Decimal(cross["pnl_total"])
+    # CSVs are in the same dir as the aggregate summary (the results/ dir),
+    # not next to the rendered report. If in_dir is provided, prefer it.
+    csv_dir = in_dir if in_dir is not None else out_path.parent
 
     # 1. TL;DR
     wr_mean = Decimal(cross["wr_mean"])
@@ -126,7 +134,7 @@ def render_report(*, aggregate: dict[str, Any], out_path: Path) -> None:
     )
 
     # 5. Breakeven analysis
-    be_csv = out_path.parent / "breakeven_sensitivity.csv"
+    be_csv = csv_dir / "breakeven_sensitivity.csv"
     breakeven_md = "See `results/breakeven_sensitivity.csv` for the full table."
     if be_csv.exists():
         with be_csv.open() as f:
@@ -135,7 +143,7 @@ def render_report(*, aggregate: dict[str, Any], out_path: Path) -> None:
             breakeven_md = "Entry-price bins (breakeven WR = entry_price):\n\n" + regime_table_markdown(be_rows, "Entry bin")
 
     # 6. Rule rankings
-    rr_csv = out_path.parent / "rule_performance_ranked.csv"
+    rr_csv = csv_dir / "rule_performance_ranked.csv"
     rule_rank_md = "See `results/rule_performance_ranked.csv` for all rules."
     if rr_csv.exists():
         with rr_csv.open() as f:
@@ -271,7 +279,7 @@ def main() -> int:
         print(f"missing {aggregate_path}", file=sys.stderr)
         return 1
     aggregate = json.loads(aggregate_path.read_text())
-    render_report(aggregate=aggregate, out_path=Path(args.out))
+    render_report(aggregate=aggregate, out_path=Path(args.out), in_dir=in_dir)
     print(f"OK: report written to {args.out}")
     return 0
 
