@@ -19,7 +19,7 @@ from typing import Any
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from polymarket_round_bot.models import Candle, Side  # noqa: E402, F401
+from polymarket_round_bot.models import BinanceState, Candle, MarketMetadata, Side  # noqa: E402, F401
 
 
 # === Data loading ===
@@ -115,6 +115,140 @@ def build_rule_index(rules):  # noqa: ANN001
 
 
 # === CLI (placeholder; full simulation in Task 4-6) ===
+
+# === Fold simulation ===
+
+def iter_round_starts(data_start: datetime, data_end: datetime) -> list[datetime]:
+    """Yield 15m round start times in [data_start, data_end), aligned to UTC quarter-hour."""
+    # Snap data_start up to the next quarter-hour (round up, not down)
+    minute = data_start.minute
+    second = data_start.second
+    micro = data_start.microsecond
+    if minute % 15 != 0 or second > 0 or micro > 0:
+        qh = ((minute // 15) + 1) * 15
+        if qh >= 60:
+            # overflow to next hour
+            data_start = data_start.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
+        else:
+            data_start = data_start.replace(minute=qh, second=0, microsecond=0)
+    starts: list[datetime] = []
+    t = data_start
+    while t + timedelta(minutes=15) <= data_end:
+        starts.append(t)
+        t = t + timedelta(minutes=15)
+    return starts
+
+
+def _build_binance_for_round(candles: list[Candle], round_start: datetime) -> BinanceState:
+    """Build a BinanceState from candles with open_time_utc < round_start.
+
+    Cap at the most recent 200 candles for performance.
+    """
+    closed = [c for c in candles if c.open_time_utc < round_start]
+    closed.sort(key=lambda c: c.open_time_utc)
+    closed = closed[-200:]
+    if not closed:
+        raise ValueError(f"no candles before {round_start}")
+    return BinanceState(
+        symbol="BTCUSDT",
+        candles=closed,
+        current_price=closed[-1].close,
+        received_at_utc=round_start,
+    )
+
+
+def _settle_trade(trade: dict[str, Any], candles: list[Candle]) -> dict[str, Any]:
+    """Settle a recorded trade by finding the c2 candle and computing PnL."""
+    round_start = trade["round_start_ts"]
+    if isinstance(round_start, str):
+        round_start = datetime.fromisoformat(round_start)
+    c2_time = round_start + timedelta(minutes=10)
+    c2 = next((c for c in candles if c.open_time_utc == c2_time), None)
+    if c2 is None:
+        # Round didn't fully close in our data
+        trade["won"] = None
+        trade["pnl"] = None
+        return trade
+    settlement = settle_round(
+        round_open=Decimal(trade["round_open_price"]),
+        round_close=c2.close,
+        recommended_side=Side(trade["recommended_side"]),
+        entry_price=Decimal(trade["entry_price"]),
+    )
+    trade["won"] = settlement["won"]
+    trade["pnl"] = str(settlement["pnl"])
+    trade["round_close_price"] = settlement["round_close"]
+    return trade
+
+
+def simulate_fold(
+    *,
+    fold: Fold,
+    candles: list[Candle],
+    rules_index,
+    min_samples: int,
+    min_historical_probability: Decimal,
+    safety_buffer: Decimal,
+    max_entry_ask: Decimal,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Run the backtest for one fold; return (trades, summary)."""
+    round_starts = iter_round_starts(fold.test_start, fold.test_end)
+    trades: list[dict[str, Any]] = []
+    for rs in round_starts:
+        try:
+            binance = _build_binance_for_round(candles, rs)
+        except ValueError:
+            continue  # skip rounds at the very start of the data
+        market = _build_market_for_round(rs)
+        try:
+            trade = simulate_round(
+                market=market, binance=binance, rules_index=rules_index,
+                min_samples=min_samples, min_historical_probability=min_historical_probability,
+                safety_buffer=safety_buffer, max_entry_ask=max_entry_ask,
+            )
+        except Exception:
+            continue  # don't let a bad round kill the fold
+        if trade is None:
+            continue
+        # Find c0 close to set round_open (already in trade), then settle
+        try:
+            trade = _settle_trade(trade, candles)
+        except Exception:
+            continue
+        if trade.get("won") is None:
+            continue  # round didn't close in our data
+        trade["fold_id"] = fold.fold_id
+        trades.append(trade)
+
+    n_trades = len(trades)
+    n_wins = sum(1 for t in trades if t.get("won") is True)
+    pnl = sum(Decimal(t["pnl"]) for t in trades)
+    wr = (Decimal(n_wins) / Decimal(n_trades)) if n_trades else Decimal("0")
+    avg_pnl = (pnl / Decimal(n_trades)) if n_trades else Decimal("0")
+    avg_entry = (sum(Decimal(t["entry_price"]) for t in trades) / Decimal(n_trades)) if n_trades else Decimal("0")
+    n_by_stage: dict[str, int] = {}
+    n_by_side: dict[str, int] = {}
+    for t in trades:
+        n_by_stage[t["stage"]] = n_by_stage.get(t["stage"], 0) + 1
+        n_by_side[t["recommended_side"]] = n_by_side.get(t["recommended_side"], 0) + 1
+
+    summary = {
+        "fold_id": fold.fold_id,
+        "train_start": fold.train_start.isoformat(),
+        "train_end": fold.train_end.isoformat(),
+        "test_start": fold.test_start.isoformat(),
+        "test_end": fold.test_end.isoformat(),
+        "n_rounds": len(round_starts),
+        "n_trades": n_trades,
+        "n_wins": n_wins,
+        "wr": str(wr),
+        "pnl": str(pnl),
+        "avg_pnl": str(avg_pnl),
+        "avg_entry_price": str(avg_entry),
+        "n_by_stage": n_by_stage,
+        "n_by_side": n_by_side,
+    }
+    return trades, summary
 
 # === Per-round simulation ===
 
