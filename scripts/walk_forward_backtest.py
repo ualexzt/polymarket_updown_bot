@@ -140,11 +140,11 @@ def iter_round_starts(data_start: datetime, data_end: datetime) -> list[datetime
 
 
 def _build_binance_for_round(candles: list[Candle], round_start: datetime) -> BinanceState:
-    """Build a BinanceState from candles with open_time_utc < round_start.
+    """Build a BinanceState from candles with open_time_utc <= round_start.
 
     Cap at the most recent 200 candles for performance.
     """
-    closed = [c for c in candles if c.open_time_utc < round_start]
+    closed = [c for c in candles if c.open_time_utc <= round_start]
     closed.sort(key=lambda c: c.open_time_utc)
     closed = closed[-200:]
     if not closed:
@@ -394,6 +394,102 @@ def settle_round(
     return {"won": won, "pnl": pnl, "round_close": str(round_close), "round_open": str(round_open)}
 
 
+def _write_candles_csv_for_test(path: Path, candles: list[Candle]) -> None:
+    """Test helper: write Candle list to the same CSV format that fetch_binance_history.py writes.
+
+    Exposed with this name to make it clear it's a test fixture helper.
+    """
+    import csv as _csv
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8", newline="") as f:
+        w = _csv.writer(f)
+        w.writerow(["open_time_utc", "open", "high", "low", "close", "volume", "is_closed", "close_time_utc"])
+        for c in candles:
+            w.writerow([
+                c.open_time_utc.isoformat(), str(c.open), str(c.high), str(c.low),
+                str(c.close), str(c.volume), "True",
+                (c.open_time_utc + timedelta(minutes=5)).isoformat(),
+            ])
+
+
+def run_pipeline(
+    *,
+    data_csv: Path,
+    rules_json: Path,
+    out_dir: Path,
+    n_folds: int,
+    test_days: int,
+    min_samples: int,
+    min_historical_probability: Decimal,
+    safety_buffer: Decimal,
+    max_entry_ask: Decimal,
+) -> dict[str, Any]:
+    """End-to-end: load data, partition folds, simulate each, write outputs."""
+    from polymarket_round_bot.probability_rules import load_rules  # noqa: PLC0415
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    print(f"Loading candles from {data_csv}...", file=sys.stderr)
+    candles = load_candles_csv(data_csv)
+    print(f"  loaded {len(candles)} candles", file=sys.stderr)
+    print(f"Loading rules from {rules_json}...", file=sys.stderr)
+    rules = load_rules(rules_json)
+    print(f"  loaded {len(rules)} rules", file=sys.stderr)
+    rules_index = build_rule_index(rules)
+
+    data_start = candles[0].open_time_utc
+    data_end = candles[-1].open_time_utc
+    folds = partition_folds(
+        data_start=data_start, data_end=data_end, n_folds=n_folds, test_days=test_days,
+    )
+    print(f"Running {len(folds)} folds...", file=sys.stderr)
+
+    fold_summaries: list[dict[str, Any]] = []
+    for fold in folds:
+        print(f"  fold {fold.fold_id}: {fold.test_start.date()} → {fold.test_end.date()}", file=sys.stderr)
+        trades, summary = simulate_fold(
+            fold=fold, candles=candles, rules_index=rules_index,
+            min_samples=min_samples, min_historical_probability=min_historical_probability,
+            safety_buffer=safety_buffer, max_entry_ask=max_entry_ask,
+        )
+        # Write per-fold outputs
+        trades_csv = out_dir / f"wf_fold_{fold.fold_id}_trades.csv"
+        if trades:
+            fieldnames = list(trades[0].keys())
+            with trades_csv.open("w", encoding="utf-8", newline="") as f:
+                w = csv.DictWriter(f, fieldnames=fieldnames)
+                w.writeheader()
+                w.writerows(trades)
+        summary_path = out_dir / f"wf_fold_{fold.fold_id}_summary.json"
+        summary_path.write_text(json.dumps(summary, indent=2))
+        fold_summaries.append(summary)
+        print(f"    n_trades={summary['n_trades']}, wr={summary['wr']}, pnl={summary['pnl']}", file=sys.stderr)
+
+    # Aggregate
+    wrs = [Decimal(s["wr"]) for s in fold_summaries if s["n_trades"] > 0]
+    pnls = [Decimal(s["pnl"]) for s in fold_summaries]
+    wr_mean = (sum(wrs) / len(wrs)) if wrs else Decimal("0")
+    # Stdev: convert to float, compute, convert back
+    wr_stdev = Decimal("0")
+    if len(wrs) > 1:
+        mean_f = float(wr_mean)
+        var = sum((float(w) - mean_f) ** 2 for w in wrs) / (len(wrs) - 1)
+        wr_stdev = Decimal(str(var ** 0.5))
+    pnl_total = sum(pnls)
+    aggregate = {
+        "data_start": data_start.isoformat(),
+        "data_end": data_end.isoformat(),
+        "n_folds": len(fold_summaries),
+        "folds": fold_summaries,
+        "cross_fold": {
+            "wr_mean": str(wr_mean),
+            "wr_stdev": str(wr_stdev),
+            "pnl_total": str(pnl_total),
+        },
+    }
+    (out_dir / "wf_aggregate_summary.json").write_text(json.dumps(aggregate, indent=2))
+    return aggregate
+
+
 def main() -> int:
     p = argparse.ArgumentParser()
     p.add_argument("--data", required=True)
@@ -401,8 +497,22 @@ def main() -> int:
     p.add_argument("--out-dir", default="results/")
     p.add_argument("--folds", type=int, default=5)
     p.add_argument("--test-days", type=int, default=30)
+    p.add_argument("--min-samples", type=int, default=60)
+    p.add_argument("--min-historical-probability", type=Decimal, default=Decimal("0.60"))
+    p.add_argument("--safety-buffer", type=Decimal, default=Decimal("0.05"))
+    p.add_argument("--max-entry-ask", type=Decimal, default=Decimal("0.80"))
     args = p.parse_args()
-    print(f"[stub] would load {args.data} and {args.rules}, write to {args.out_dir}", file=sys.stderr)
+    run_pipeline(
+        data_csv=Path(args.data),
+        rules_json=Path(args.rules),
+        out_dir=Path(args.out_dir),
+        n_folds=args.folds,
+        test_days=args.test_days,
+        min_samples=args.min_samples,
+        min_historical_probability=args.min_historical_probability,
+        safety_buffer=args.safety_buffer,
+        max_entry_ask=args.max_entry_ask,
+    )
     return 0
 
 
