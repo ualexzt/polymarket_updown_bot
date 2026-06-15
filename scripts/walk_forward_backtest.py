@@ -423,6 +423,8 @@ def run_pipeline(
     min_historical_probability: Decimal,
     safety_buffer: Decimal,
     max_entry_ask: Decimal,
+    test_start: datetime | None = None,
+    test_end: datetime | None = None,
 ) -> dict[str, Any]:
     """End-to-end: load data, partition folds, simulate each, write outputs."""
     from polymarket_round_bot.probability_rules import load_rules  # noqa: PLC0415
@@ -438,9 +440,25 @@ def run_pipeline(
 
     data_start = candles[0].open_time_utc
     data_end = candles[-1].open_time_utc
-    folds = partition_folds(
-        data_start=data_start, data_end=data_end, n_folds=n_folds, test_days=test_days,
-    )
+
+    # If explicit test window is provided, build a single fold from it.
+    if test_start is not None and test_end is not None:
+        if test_start < data_start:
+            test_start = data_start
+        if test_end > data_end:
+            test_end = data_end
+        folds = [Fold(
+            fold_id=0,
+            train_start=data_start,
+            train_end=test_start,
+            test_start=test_start,
+            test_end=test_end,
+        )]
+        print(f"Using explicit test window: {test_start} → {test_end}", file=sys.stderr)
+    else:
+        folds = partition_folds(
+            data_start=data_start, data_end=data_end, n_folds=n_folds, test_days=test_days,
+        )
     print(f"Running {len(folds)} folds...", file=sys.stderr)
 
     fold_summaries: list[dict[str, Any]] = []
@@ -497,11 +515,19 @@ def main() -> int:
     p.add_argument("--out-dir", default="results/")
     p.add_argument("--folds", type=int, default=5)
     p.add_argument("--test-days", type=int, default=30)
+    p.add_argument("--test-start", type=str, default=None,
+                   help="ISO datetime, e.g. 2026-06-06T11:51:00+00:00. If set with --test-end, builds a single fold.")
+    p.add_argument("--test-end", type=str, default=None,
+                   help="ISO datetime. If set with --test-start, builds a single fold.")
     p.add_argument("--min-samples", type=int, default=60)
     p.add_argument("--min-historical-probability", type=Decimal, default=Decimal("0.60"))
     p.add_argument("--safety-buffer", type=Decimal, default=Decimal("0.05"))
     p.add_argument("--max-entry-ask", type=Decimal, default=Decimal("0.80"))
     args = p.parse_args()
+
+    test_start_dt = datetime.fromisoformat(args.test_start) if args.test_start else None
+    test_end_dt = datetime.fromisoformat(args.test_end) if args.test_end else None
+
     run_pipeline(
         data_csv=Path(args.data),
         rules_json=Path(args.rules),
@@ -512,6 +538,8 @@ def main() -> int:
         min_historical_probability=args.min_historical_probability,
         safety_buffer=args.safety_buffer,
         max_entry_ask=args.max_entry_ask,
+        test_start=test_start_dt,
+        test_end=test_end_dt,
     )
     return 0
 

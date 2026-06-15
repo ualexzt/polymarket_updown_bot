@@ -15,6 +15,7 @@ from scripts.walk_forward_backtest import (
     load_candles_csv,
     partition_folds,
     build_rule_index,
+    run_pipeline,
 )
 
 
@@ -83,3 +84,43 @@ def test_build_rule_index_finds_exact_match(sample_rules):
     assert rule is not None
     assert rule.samples == 120
     assert match_type.value == "exact"
+
+
+def test_run_pipeline_with_explicit_window(synthetic_5d_candles, sample_rules, tmp_path, tmp_results_dir):
+    """When test_start/test_end are provided, the script builds a single fold with those boundaries."""
+    rules_path = tmp_path / "rules.json"
+    rules_path.write_text(json.dumps([
+        {
+            "rule_id": r.rule_id,
+            "stage": r.stage.value,
+            "current_side": r.current_side.value,
+            "distance_bucket": r.distance_bucket.value,
+            "volatility_bucket": r.volatility_bucket.value,
+            "pattern": r.pattern,
+            "recommended_side": r.recommended_side.value,
+            "historical_probability": str(r.historical_probability),
+            "samples": r.samples,
+            "median_round_return": str(r.median_round_return),
+            "return_aligned": r.return_aligned,
+            "usable_signal": r.usable_signal,
+        }
+        for r in sample_rules
+    ]))
+    data_csv = tmp_path / "candles.csv"
+    _write_candles_csv(data_csv, synthetic_5d_candles)
+
+    summary = run_pipeline(
+        data_csv=data_csv,
+        rules_json=rules_path,
+        out_dir=tmp_results_dir,
+        n_folds=5, test_days=30,  # ignored when explicit window is set
+        test_start=datetime(2026, 6, 1, 0, 0, tzinfo=UTC),
+        test_end=datetime(2026, 6, 3, 0, 0, tzinfo=UTC),
+        min_samples=60,
+        min_historical_probability=Decimal("0.60"),
+        safety_buffer=Decimal("0.05"),
+        max_entry_ask=Decimal("0.80"),
+    )
+    assert len(summary["folds"]) == 1
+    assert summary["folds"][0]["test_start"].startswith("2026-06-01")
+    assert summary["folds"][0]["test_end"].startswith("2026-06-03")
