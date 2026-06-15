@@ -333,6 +333,12 @@ def write_outputs(
                 v = d.get(k)
                 return str(v) if v is not None else default
 
+            def is_match(l, b, tol=entry_tolerance):
+                try:
+                    return "match" if abs(Decimal(str(l)) - Decimal(str(b))) <= tol else "DIFF"
+                except Exception:
+                    return "DIFF" if str(l) != str(b) else "match"
+
             writer.writerow([
                 get(live, "market_slug"),
                 get(live, "entry_price"), get(back, "entry_price"),
@@ -349,7 +355,9 @@ def write_outputs(
                 get(live, "won"), get(back, "won"),
                 "match" if str(bool(live.get("won"))) == str(bool(back.get("won"))) else "DIFF",
                 get(live, "realized_pnl_usd"), get(back, "pnl"),
+                is_match(live.get("realized_pnl_usd"), back.get("pnl"), entry_tolerance),
                 get(live, "round_close_price"), get(back, "round_close_price"),
+                is_match(live.get("round_close_price"), back.get("round_close_price"), entry_tolerance),
                 get(live, "rule_id"), get(back, "rule_id"),
                 "match" if get(live, "rule_id") == get(back, "rule_id") else "DIFF",
                 str(len(diff.get("field_diffs", []))),
