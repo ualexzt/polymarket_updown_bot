@@ -1,0 +1,9 @@
+{
+  "enabled": true,
+  "allowed_rules": {},
+  "quarantined_rules": {
+    "btc_15m_after_5m_above_open_d_010_020pct_vol_normal_strong_bull_close_near_high": "quarantined 2026-06-17: live paper n=34 WR=52.9% avg_entry=0.755 PnL=-16.3543",
+    "btc_15m_after_5m_below_open_d_010_020pct_vol_normal_strong_bear_close_near_low": "quarantined 2026-06-17: live paper n=12 WR=33.3% avg_entry=0.730 PnL=-6.6994",
+    "btc_15m_after_5m_above_open_d_005_010pct_vol_normal_normal_bull": "quarantined 2026-06-17: live paper n=16 WR=43.8% avg_entry=0.626 PnL=-6.5558"
+  }
+}

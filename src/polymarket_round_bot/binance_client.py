@@ -6,7 +6,7 @@ Fallback: https://api.binance.com/api/v3/klines
 from __future__ import annotations
 
 import time
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Final
 
@@ -122,7 +122,7 @@ def fetch_5m_close_at(
     timeout: int = 15,
     user_agent: str = "polymarket-round-bot/0.1",
 ) -> Decimal | None:
-    """Return the close of the 5m candle whose open_time <= target_utc.
+    """Return the close of the last 5m candle before ``target_utc``.
 
     Used by stale-position settlement: when Gamma no longer carries the
     market, we use the Binance 5m close at the window boundary as the
@@ -131,15 +131,31 @@ def fetch_5m_close_at(
     Returns None if no candle is available (network error, very old data,
     or target is in the future of the latest closed candle).
     """
-    state = fetch_recent_5m_klines(
-        symbol,
-        limit=2,  # only need the candle covering target_utc
-        timeout=timeout,
-        user_agent=user_agent,
-    )
-    target_ts = target_utc.timestamp()
-    # Find the closed candle whose open_time is the latest <= target.
-    candidates = [c for c in state.candles if c.open_time_utc.timestamp() <= target_ts]
-    if not candidates:
-        return None
-    return candidates[-1].close
+    target = target_utc.astimezone(UTC)
+    start = target - timedelta(minutes=15)
+    params = {
+        "symbol": symbol,
+        "interval": "5m",
+        "startTime": str(int(start.timestamp() * 1000)),
+        "endTime": str(int(target.timestamp() * 1000)),
+        "limit": "10",
+    }
+    headers = {"User-Agent": user_agent, "Accept": "application/json"}
+
+    for endpoint in _BINANCE_KLINES_ENDPOINTS:
+        try:
+            with httpx.Client(timeout=timeout) as client:
+                resp = client.get(endpoint, params=params, headers=headers)
+            resp.raise_for_status()
+            data = resp.json()
+            if not isinstance(data, list) or not data:
+                continue
+            candles = [_row_to_candle(r, is_closed=True) for r in data]
+            candidates = [c for c in candles if c.open_time_utc < target]
+            if candidates:
+                candidates.sort(key=lambda c: c.open_time_utc)
+                return candidates[-1].close
+        except (httpx.HTTPError, BinanceError):
+            continue
+
+    return None
