@@ -138,8 +138,8 @@ class OrderbookStream:
                 async with websockets.connect(
                     WS_URL,
                     additional_headers={"User-Agent": "polymarket-round-bot/0.1"},
-                    ping_interval=None,  # we handle PING manually
-                    ping_timeout=None,
+                    ping_interval=20,  # let library handle protocol-level pings
+                    ping_timeout=20,
                     close_timeout=5,
                 ) as ws:
                     self._connected = True
