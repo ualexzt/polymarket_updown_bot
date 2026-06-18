@@ -53,6 +53,7 @@ class Settings(BaseSettings):
     max_spread: Decimal = Field(default=Decimal("0.03"))
     min_liquidity_usd: Decimal = Field(default=Decimal("25"))
     min_historical_probability: Decimal = Field(default=Decimal("0.60"))
+    require_usable_signal: bool = Field(default=True)
     min_samples: int = Field(default=60)
 
     # === Position / risk caps ===

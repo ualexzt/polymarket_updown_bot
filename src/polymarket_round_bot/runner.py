@@ -151,6 +151,7 @@ class Runner:
             pattern=state.candle_pattern,
             min_samples=self._settings.min_samples,
             min_historical_probability=self._settings.min_historical_probability,
+            require_usable_signal=self._settings.require_usable_signal,
         )
         log.info(
             "rule_lookup match_type=%s rule_id=%s prob=%s samples=%d no_trade_reasons=%s",

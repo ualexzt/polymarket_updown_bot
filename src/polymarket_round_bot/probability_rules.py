@@ -156,6 +156,7 @@ class ProbabilityRules:
         pattern: str,
         min_samples: int,
         min_historical_probability: Decimal,
+        require_usable_signal: bool = True,
     ) -> RuleLookupResult:
         rule, match_type = self._index.lookup(
             stage=stage,
@@ -177,7 +178,7 @@ class ProbabilityRules:
                 no_trade_reasons=no_trade_reasons,
             )
 
-        if not rule.usable_signal:
+        if require_usable_signal and not rule.usable_signal:
             no_trade_reasons.append("usable_signal_false")
         if rule.samples < min_samples:
             no_trade_reasons.append(
