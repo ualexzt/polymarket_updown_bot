@@ -160,9 +160,9 @@ class OrderbookStream:
                 log.warning("orderbook_ws_disconnected err=%s reconnect_in=%fs", e, backoff)
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2, RECONNECT_MAX_S)
-            except Exception:
+            except Exception as e:
                 self._connected = False
-                log.exception("orderbook_ws_unexpected_error")
+                log.error("orderbook_ws_unexpected_error err=%s type=%s", e, type(e).__name__)
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2, RECONNECT_MAX_S)
 
@@ -172,9 +172,11 @@ class OrderbookStream:
             try:
                 msg = json.loads(raw)
             except (json.JSONDecodeError, TypeError):
+                log.debug("orderbook_ws_raw_non_json len=%d", len(str(raw)[:50]))
                 continue
 
             event_type = msg.get("event_type") or msg.get("type")
+            log.debug("orderbook_ws_event type=%s keys=%s", event_type, list(msg.keys())[:5])
 
             if event_type == "book":
                 self._handle_book(msg)
@@ -192,12 +194,14 @@ class OrderbookStream:
                 log.debug("orderbook_ws_unknown_event type=%s", event_type)
 
     async def _heartbeat(self, ws: websockets.ClientConnection) -> None:
-        """Send PING every 10 seconds."""
+        """Send application-level PING every 5 seconds."""
         while True:
-            await asyncio.sleep(PING_INTERVAL_S)
+            await asyncio.sleep(5)
             try:
                 await ws.send("PING")
+                log.debug("orderbook_ws_ping_sent")
             except (ConnectionClosed, OSError):
+                log.debug("orderbook_ws_ping_failed")
                 break
 
     async def _subscription_manager(self, ws: websockets.ClientConnection) -> None:
@@ -221,7 +225,9 @@ class OrderbookStream:
                 "custom_feature_enabled": True,
             }
             try:
-                await ws.send(json.dumps(msg))
+                payload = json.dumps(msg)
+                log.info("orderbook_ws_sending_subscribe payload_len=%d", len(payload))
+                await ws.send(payload)
                 with self._lock:
                     self._subscribed_ids.update(to_sub)
                 log.info("orderbook_ws_subscribed tokens=%d ids=%s", len(to_sub), to_sub[:3])
