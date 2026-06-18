@@ -32,6 +32,7 @@ from polymarket_round_bot.rule_whitelist import (
     load_rule_whitelist,
 )
 from polymarket_round_bot.runner import Runner, current_expected_slug
+from polymarket_round_bot.orderbook_stream import OrderbookStream
 from polymarket_round_bot.storage import Storage
 from polymarket_round_bot.url_parser import parse_market_url
 
@@ -154,6 +155,11 @@ def main() -> int:
     broker = PaperBroker()
     risk = RiskManager(settings)
 
+    # Start WebSocket orderbook stream
+    orderbook_stream = OrderbookStream()
+    orderbook_stream.start()
+    log.info("orderbook_stream_initialized")
+
     run_id = f"run_{uuid.uuid4().hex[:12]}"
     storage.start_run(
         run_id,
@@ -171,6 +177,7 @@ def main() -> int:
         slug=slug,
         timeframe=args.timeframe if not (args.event_url or args.slug) else None,
         rule_policy=rule_policy,
+        orderbook_stream=orderbook_stream,
     )
 
     try:
@@ -186,6 +193,7 @@ def main() -> int:
     except KeyboardInterrupt:
         log.info("interrupted")
     finally:
+        orderbook_stream.stop()
         storage.end_run(run_id, notes="graceful_shutdown")
     return 0
 

@@ -27,6 +27,7 @@ from .models import (
 )
 from .paper_broker import PaperBroker, PaperBrokerError
 from .polymarket_clob_client import fetch_pair_orderbook, levels_to_json
+from .orderbook_stream import OrderbookStream
 from .polymarket_discovery import discover_market
 from .probability_rules import ProbabilityRules
 from .risk_manager import RiskManager
@@ -86,6 +87,7 @@ class Runner:
         slug: str,
         timeframe: Timeframe | None = None,
         rule_policy: RuleWhitelist | None = None,
+        orderbook_stream: OrderbookStream | None = None,
     ) -> None:
         self._settings = settings
         self._storage = storage
@@ -98,7 +100,64 @@ class Runner:
         # (slug stays fixed for the lifetime of the runner).
         self._timeframe = timeframe
         self._rule_policy = rule_policy
+        self._orderbook_stream = orderbook_stream
         self._telegram_reports = TelegramReportService(settings, storage)
+        self._current_market_tokens: tuple[str, str] | None = None
+
+    # === Orderbook fetching ===
+
+    def _fetch_orderbook(self, market: Any) -> Any:
+        """Fetch orderbook: WS cache first, REST fallback."""
+        from .models import OrderbookLevel, OrderbookSnapshot, PairOrderbook
+
+        # Update WS subscription if market changed
+        if self._orderbook_stream:
+            new_tokens = (market.up_token_id, market.down_token_id)
+            if self._current_market_tokens != new_tokens:
+                if self._current_market_tokens:
+                    self._orderbook_stream.unsubscribe(list(self._current_market_tokens))
+                self._orderbook_stream.subscribe(list(new_tokens))
+                self._current_market_tokens = new_tokens
+
+        # Try WS cache first
+        if self._orderbook_stream and self._orderbook_stream.is_connected():
+            up_book = self._orderbook_stream.get_book(market.up_token_id)
+            down_book = self._orderbook_stream.get_book(market.down_token_id)
+            if up_book and down_book and up_book.best_ask is not None and down_book.best_ask is not None:
+                now = datetime.now(UTC)
+                up = OrderbookSnapshot(
+                    token_id=market.up_token_id,
+                    best_bid=up_book.best_bid,
+                    best_ask=up_book.best_ask,
+                    spread=up_book.spread,
+                    bid_size=None,
+                    ask_size=None,
+                    top_5_bids=[],
+                    top_5_asks=[],
+                    liquidity_usd_estimate=None,
+                    received_at_utc=now,
+                )
+                down = OrderbookSnapshot(
+                    token_id=market.down_token_id,
+                    best_bid=down_book.best_bid,
+                    best_ask=down_book.best_ask,
+                    spread=down_book.spread,
+                    bid_size=None,
+                    ask_size=None,
+                    top_5_bids=[],
+                    top_5_asks=[],
+                    liquidity_usd_estimate=None,
+                    received_at_utc=now,
+                )
+                return PairOrderbook(up=up, down=down, received_at_utc=now)
+
+        # Fallback to REST
+        return fetch_pair_orderbook(
+            market.up_token_id,
+            market.down_token_id,
+            timeout=self._settings.http_timeout_seconds,
+            user_agent=self._settings.http_user_agent,
+        )
 
     # === One cycle ===
 
@@ -162,19 +221,15 @@ class Runner:
             lookup.no_trade_reasons,
         )
 
-        # 5. Orderbook
-        pair = fetch_pair_orderbook(
-            market.up_token_id,
-            market.down_token_id,
-            timeout=self._settings.http_timeout_seconds,
-            user_agent=self._settings.http_user_agent,
-        )
+        # 5. Orderbook — WS cache first, REST fallback
+        pair = self._fetch_orderbook(market)
         log.info(
-            "orderbook up_bid=%s up_ask=%s down_bid=%s down_ask=%s",
+            "orderbook up_bid=%s up_ask=%s down_bid=%s down_ask=%s ws=%s",
             pair.up.best_bid,
             pair.up.best_ask,
             pair.down.best_bid,
             pair.down.best_ask,
+            "ws" if self._orderbook_stream and self._orderbook_stream.is_connected() else "rest",
         )
 
         # 6. Risk

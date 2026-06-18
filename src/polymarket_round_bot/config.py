@@ -120,6 +120,11 @@ class Settings(BaseSettings):
     telegram_report_hours_kyiv: str = Field(default="8,20")
     telegram_report_state_path: str = Field(default="data/telegram_report_state.json")
 
+    # === Telegram alerts ===
+    telegram_alerts_enabled: bool = Field(default=False)
+    telegram_alert_state_path: str = Field(default="data/telegram_alert_state.json")
+    telegram_alert_max_decision_age_seconds: int = Field(default=300)
+
     # === HTTP ===
     http_timeout_seconds: int = Field(default=15)
     http_user_agent: str = Field(default="polymarket-round-bot/0.1")
@@ -147,3 +152,7 @@ class Settings(BaseSettings):
     @property
     def telegram_report_state_file(self) -> Path:
         return self.resolve("telegram_report_state_path")
+
+    @property
+    def telegram_alert_state_file(self) -> Path:
+        return self.resolve("telegram_alert_state_path")

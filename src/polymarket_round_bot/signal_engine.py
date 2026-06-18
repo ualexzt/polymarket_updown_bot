@@ -405,8 +405,10 @@ def build_decision(
             edge_vs_ask=edge_vs_ask,
         )
 
-    # Liquidity
-    if liquidity is None or liquidity < settings.min_liquidity_usd:
+    # Liquidity — skip only when we have data AND it's too low.
+    # WS best_bid_ask events don't include depth, so liquidity=None is
+    # acceptable (the order placement API will reject if truly illiquid).
+    if liquidity is not None and liquidity < settings.min_liquidity_usd:
         return _skip(
             state,
             market,
