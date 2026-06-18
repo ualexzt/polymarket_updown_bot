@@ -169,29 +169,46 @@ class OrderbookStream:
     async def _reader(self, ws: websockets.ClientConnection) -> None:
         """Read messages from WS and update cache."""
         async for raw in ws:
+            # Handle plain-text PONG response
+            if isinstance(raw, str) and not raw.startswith("{") and not raw.startswith("["):
+                log.debug("orderbook_ws_text msg=%s", raw[:50])
+                continue
             try:
                 msg = json.loads(raw)
             except (json.JSONDecodeError, TypeError):
-                log.debug("orderbook_ws_raw_non_json len=%d", len(str(raw)[:50]))
+                log.debug("orderbook_ws_non_json len=%d", len(str(raw)[:50]))
                 continue
 
-            event_type = msg.get("event_type") or msg.get("type")
-            log.debug("orderbook_ws_event type=%s keys=%s", event_type, list(msg.keys())[:5])
+            # Handle list responses (subscription confirmations)
+            if isinstance(msg, list):
+                log.debug("orderbook_ws_list len=%d", len(msg))
+                for item in msg:
+                    if isinstance(item, dict):
+                        self._process_event(item)
+                continue
 
-            if event_type == "book":
-                self._handle_book(msg)
-            elif event_type == "best_bid_ask":
-                self._handle_best_bid_ask(msg)
-            elif event_type == "price_change":
-                self._handle_price_change(msg)
-            elif event_type in ("last_trade_price", "tick_size_change"):
-                pass  # informational, not needed for orderbook
-            elif event_type in ("new_market", "market_resolved"):
-                pass  # lifecycle, not needed here
-            elif msg.get("type") == "PONG":
-                pass  # heartbeat response
-            else:
-                log.debug("orderbook_ws_unknown_event type=%s", event_type)
+            if isinstance(msg, dict):
+                self._process_event(msg)
+
+    def _process_event(self, msg: dict[str, Any]) -> None:
+        """Process a single event message."""
+        event_type = msg.get("event_type") or msg.get("type")
+        log.debug("orderbook_ws_event type=%s keys=%s", event_type, list(msg.keys())[:5])
+
+        if event_type == "book":
+            self._handle_book(msg)
+        elif event_type == "best_bid_ask":
+            self._handle_best_bid_ask(msg)
+        elif event_type == "price_change":
+            self._handle_price_change(msg)
+        elif event_type in ("last_trade_price", "tick_size_change"):
+            pass  # informational, not needed for orderbook
+        elif event_type in ("new_market", "market_resolved"):
+            pass  # lifecycle, not needed here
+        elif event_type in ("PONG", "pong", "ping"):
+            pass  # heartbeat response/request
+        else:
+            log.debug("orderbook_ws_unknown_event type=%s", event_type)
 
     async def _heartbeat(self, ws: websockets.ClientConnection) -> None:
         """Send application-level PING every 5 seconds."""
